@@ -64,143 +64,10 @@ fn main() {
 
 // ---------- new ----------
 
-const SCAFFOLD_ABI_RS: &str = r#"//! The job ABI, inlined so this crate compiles standalone.
-//! Contract with the emulator (crates/abi in provework has the docs):
 
-pub const INPUT_LEN_ADDR: u64 = 0x1000_0000;
-pub const INPUT_DATA_ADDR: u64 = 0x1000_0008;
-pub const OUTPUT_LEN_ADDR: u64 = 0x2000_0000;
-pub const OUTPUT_DATA_ADDR: u64 = 0x2000_0008;
-pub const ELF_BASE: u64 = 0x8000_0000;
-pub const STACK_TOP: u64 = 0x83F0_0000;
-pub const ISA: &str = "rv64imc";
-"#;
+mod scaffold;
+use scaffold::*;
 
-const SCAFFOLD_MAIN_RS: &str = r#"//! Your job: a deterministic, integer-only program. No network, no
-//! filesystem, no clock, no floats. The emulator executes exactly this
-//! code and the receipt proves the exact traversal.
-
-#![no_std]
-#![no_main]
-
-use core::arch::asm;
-use core::panic::PanicInfo;
-use core::ptr;
-
-#[panic_handler]
-fn panic(_: &PanicInfo) -> ! {
-    unsafe { asm!("ebreak", options(noreturn)) }
-}
-
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
-    unsafe {
-        let in_len = ptr::read_volatile(crate::abi::INPUT_LEN_ADDR as *const u64) as usize;
-        let in_ptr = crate::abi::INPUT_DATA_ADDR as *const u8;
-
-        // TODO: your computation over the input bytes.
-        let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
-        for i in 0..in_len {
-            acc = (acc ^ ptr::read_volatile(in_ptr.add(i)) as u64).wrapping_mul(0x100_0000_01b3);
-        }
-
-        // Write the result: u64 length, then bytes.
-        let result = acc.to_le_bytes();
-        ptr::write_volatile(crate::abi::OUTPUT_LEN_ADDR as *mut u64, result.len() as u64);
-        for (i, &b) in result.iter().enumerate() {
-            ptr::write_volatile((crate::abi::OUTPUT_DATA_ADDR as *mut u8).add(i), b);
-        }
-
-        asm!("ebreak", options(noreturn))
-    }
-}
-"#;
-
-const SCAFFOLD_LINK_LD: &str = r#"OUTPUT_ARCH("riscv")
-ENTRY(_start)
-
-MEMORY {
-    RAM (rwx) : ORIGIN = 0x80000000, LENGTH = 60M
-}
-
-SECTIONS {
-    .text : {
-        KEEP(*(.text._start))
-        *(.text .text.*)
-    } > RAM
-
-    .rodata : ALIGN(8) {
-        *(.rodata .rodata.*)
-        *(.srodata .srodata.*)
-    } > RAM
-
-    .data : ALIGN(8) {
-        __global_pointer$ = . + 0x800;
-        *(.sdata .sdata.*)
-        *(.data .data.*)
-    } > RAM
-
-    .bss (NOLOAD) : ALIGN(8) {
-        *(.sbss .sbss.*)
-        *(.bss .bss.*)
-    } > RAM
-}
-"#;
-
-const SCAFFOLD_CARGO_TOML: &str = r#"[package]
-name = "{{NAME}}"
-version = "0.1.0"
-edition = "2021"
-
-# Detached from any workspace: this crate targets RISC-V.
-[workspace]
-
-[dependencies]
-abi = { path = "abi" }
-
-[profile.release]
-panic = "abort"
-opt-level = 2
-lto = true
-codegen-units = 1
-"#;
-
-const SCAFFOLD_CARGO_CONFIG: &str = r#"[build]
-target = "riscv64imac-unknown-none-elf"
-
-[target.riscv64imac-unknown-none-elf]
-# -a: no atomics → no lr/sc in the instruction stream (the emulator
-# pins rv64imc). Compressed instructions are fine.
-rustflags = [
-    "-C", "link-arg=-Tlink.ld",
-    "-C", "target-feature=-a",
-]
-"#;
-
-const SCAFFOLD_README: &str = r#"# {{NAME}} — a provework job
-
-A deterministic, integer-only program that runs inside the provework
-sandbox on machines nobody has to trust.
-
-## Constraints (the sandbox enforces these)
-
-- Integer math only — no floating point, no atomics (`-a`).
-- No network, no filesystem, no clock, no randomness.
-- Fully deterministic: the same input always produces the same
-  receipt chain on every machine.
-- Input arrives at `abi::INPUT_DATA_ADDR` (length at `INPUT_LEN_ADDR`);
-  write your result to `abi::OUTPUT_DATA_ADDR` (length at
-  `OUTPUT_LEN_ADDR`); halt with `ebreak`.
-- Runs at ~1/100th to ~1/1000th of native speed — size accordingly.
-
-## Flow
-
-```bash
-jobkit build .        # compile for RISC-V + validate the ELF
-jobkit submit . --server <coordinator:7777>   # delegate + wait for the receipt
-jobkit evidence --results <results-dir> --job-id <id>   # auditor bundle
-```
-"#;
 
 fn new_job(name: &str) {
     let dir = Path::new(name);
@@ -227,21 +94,11 @@ fn new_job(name: &str) {
     std::fs::write(dir.join("abi/mod.rs"), "pub mod abi;\n").unwrap();
     std::fs::write(dir.join("src/main.rs"), SCAFFOLD_MAIN_RS).unwrap();
     // A minimal manifest so `jobkit submit` works out of the box.
-    let manifest = serde_json::json!({
-        "schema": 1,
-        "id": format!("{name}-0001"),
-        "name": name,
-        "isa": "rv64imc",
-        "toolchain": "rustc, riscv64imac-unknown-none-elf, rust-lld, link.ld",
-        "chunk_size": 1_048_576u64,
-        "max_instructions": 4_000_000_000u64,
-        "verification_class": "quorum3",
-        "elf": "program.elf",
-        "input": "input.bin",
-    });
-    std::fs::write(dir.join("job.json"), serde_json::to_vec_pretty(&manifest).unwrap())
-        .unwrap();
-    std::fs::write(dir.join("input.bin"), b"provework sample input\n").unwrap();
+    let manifest_json = scaffold::SCAFFOLD_MANIFEST
+        .replace("{{NAME}}", name)
+        .replace("{{ID}}", &format!("{name}-0001"));
+    std::fs::write(dir.join("job.json"), manifest_json).unwrap();
+    std::fs::write(dir.join("input.bin"), scaffold::SCAFFOLD_SAMPLE_INPUT).unwrap();
     println!("scaffolded job crate: {name}/");
     println!("next: write your computation in src/main.rs, put your input in input.bin, then `jobkit build {name}`");
 }
