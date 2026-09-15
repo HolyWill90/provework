@@ -1,0 +1,16 @@
+[package]
+name = "jobkit"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+abi = { workspace = true }
+contentstore = { workspace = true }
+jobfmt = { workspace = true }
+rvcore = { workspace = true }
+wire = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand_core = { workspace = true }
+blake3 = { workspace = true }
