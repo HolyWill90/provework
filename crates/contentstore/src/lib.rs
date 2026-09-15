@@ -13,6 +13,12 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ContentId([u8; 32]);
 
+impl From<ContentId> for [u8; 32] {
+    fn from(id: ContentId) -> Self {
+        id.0
+    }
+}
+
 impl ContentId {
     pub fn from_data(data: &[u8]) -> Self {
         ContentId(*blake3::hash(data).as_bytes())

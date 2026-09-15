@@ -16,7 +16,7 @@ use jobfmt::WorkerResult;
 /// f^N for a cheating fraction f) and makes detected fraud
 /// economically irrational via bonds. The zk tier is what removes the
 /// trust assumption entirely; this tier is what runs cheaply today.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub enum Decision {
     /// Majority hash + the output of the agreeing group + worker ids.
     /// `zk` marks an acceptance made on a verified SP1 receipt: one

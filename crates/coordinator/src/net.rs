@@ -41,6 +41,13 @@ pub struct ServeConfig {
     /// claims, verified by an external verifier binary. None = receipt
     /// claims are refused.
     pub zk: Option<ZkVerify>,
+    /// When true, authenticated connections may submit job descriptors
+    /// over the wire; each lands in the watched jobs directory.
+    pub accept_submissions: bool,
+    /// When set, every finished job's full outcome (decision, results,
+    /// ledger deltas) is persisted here as `{job_id}.json` — the raw
+    /// material for evidence bundles.
+    pub results_dir: Option<PathBuf>,
     /// Admission proof-of-work difficulty in leading-zero bits (0
     /// disables). The fresh per-connection nonce forces the work to be
     /// redone on every reconnect, which is what makes bans and
@@ -87,6 +94,13 @@ enum Event {
         listen_port: Option<u16>,
     },
     NonceSig { conn: usize, sig: Option<String>, pow_counter: u64 },
+    JobSubmission {
+        conn: usize,
+        submitter: String,
+        descriptor: contentstore::JobDescriptor,
+        pubkey_hex: String,
+        sig_hex: String,
+    },
     ReceiptClaim {
         conn: usize,
         worker_id: String,
@@ -131,6 +145,9 @@ struct PendingJob {
     /// one attempt per dispatched worker, so a rejected or slow claim
     /// cannot be repeated to stall the verifier again and again.
     receipt_claimed: Vec<String>,
+    /// Connections that submitted this job remotely and wait for the
+    /// outcome notice.
+    subscribers: Vec<usize>,
 }
 
 pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
@@ -255,6 +272,7 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
                     started: Instant::now(),
                     zk_accept: None,
                     receipt_claimed: Vec::new(),
+                    subscribers: Vec::new(),
                 });
             }
         }
@@ -448,6 +466,7 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
                         started: job.started,
                         zk_accept: job.zk_accept.take(),
                         receipt_claimed: job.receipt_claimed.clone(),
+                        subscribers: std::mem::take(&mut job.subscribers),
                     });
                 } else if job.started.elapsed() > cfg.per_job_deadline {
                     job_finished = Some(PendingJob {
@@ -462,6 +481,7 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
                         started: job.started,
                         zk_accept: job.zk_accept.take(),
                         receipt_claimed: job.receipt_claimed.clone(),
+                        subscribers: std::mem::take(&mut job.subscribers),
                     });
                 }
             }
@@ -494,6 +514,39 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
                 decision
             );
             let deltas = slashing(&decision, &job.results);
+
+            // Notify remote submitters waiting on this job.
+            if let Decision::Accept { hash, agreed, output_hex, zk } = &decision {
+                let notice = ServerToClient::JobOutcome {
+                    job_id: job_id.clone(),
+                    hash: hash.clone(),
+                    agreed: agreed.clone(),
+                    output_hex: output_hex.clone(),
+                    zk: *zk,
+                    rejected_reason: None,
+                };
+                for &conn in &job.subscribers {
+                    if let Some(c) = conns.lock().unwrap().get(&conn) {
+                        let _ = c.outbound.send(notice.clone());
+                    }
+                }
+            }
+
+            // Evidence raw material: persist the full outcome for the
+            // evidence-bundle assembler.
+            if let Some(rd) = &cfg.results_dir {
+                let _ = std::fs::create_dir_all(rd);
+                let record = serde_json::json!({
+                    "job_id": job_id,
+                    "decision": decision,
+                    "results": job.results,
+                    "ledger_deltas": deltas,
+                });
+                let _ = std::fs::write(
+                    rd.join(format!("{job_id}.json")),
+                    serde_json::to_vec_pretty(&record).unwrap_or_default(),
+                );
+            }
             finish_ledger(&cfg, &job_id, &decision, &deltas);
             let outcome = JobOutcome {
                 job_id: job_id.clone(),
@@ -682,6 +735,18 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
                         job.results.push(result);
                     }
                 }
+            }
+            Event::JobSubmission {
+                conn,
+                submitter,
+                descriptor,
+                pubkey_hex,
+                sig_hex,
+            } => {
+                handle_job_submission(
+                    &cfg, &conns, &mut pending, conn, &submitter, descriptor,
+                    &pubkey_hex, &sig_hex,
+                );
             }
             Event::ReceiptClaim {
                 conn,
@@ -881,7 +946,130 @@ fn judge_by_replay_network(
     Some(Decision::Accept { hash, output_hex, agreed, zk: false })
 }
 
-/// The zk receipt-claim admission gate: exactly one claim attempt per
+/// Validate and land a remotely submitted job descriptor. The
+/// connection must be authenticated (same Hello/PoW/nonce flow as
+/// workers), the signature must bind the submitter's identity to the
+/// descriptor's content id, and the descriptor must pass the same
+/// confinement rules the file path enforces. Accepted submissions are
+/// written into the watched jobs directory — the existing scanner
+/// picks them up exactly like hand-dropped files.
+#[allow(clippy::too_many_arguments)]
+fn handle_job_submission(
+    cfg: &ServeConfig,
+    conns: &Arc<Mutex<HashMap<usize, Conn>>>,
+    pending: &mut Option<PendingJob>,
+    conn: usize,
+    submitter: &str,
+    descriptor: contentstore::JobDescriptor,
+    pubkey_hex: &str,
+    sig_hex: &str,
+) {
+    if !cfg.accept_submissions {
+        eprintln!("SECURITY: job submission from {submitter} dropped — submissions disabled");
+        return;
+    }
+    let mut map = conns.lock().unwrap();
+    let Some(c) = map.get_mut(&conn) else {
+        eprintln!("SECURITY: job submission from unknown conn {conn} dropped");
+        return;
+    };
+    if !c.authed {
+        eprintln!("SECURITY: job submission from unauthenticated conn {conn} dropped");
+        return;
+    }
+    if let (Some(pk), Some(claimed)) = (&c.pubkey, Some(pubkey_hex)) {
+        if pk != claimed {
+            eprintln!("SECURITY: job submission key mismatch on conn {conn}");
+            return;
+        }
+    }
+    drop(map);
+
+    // The signature binds the submitter to the exact descriptor:
+    // submission_message(job_id, blake3(canonical descriptor json)).
+    let desc_json = match serde_json::to_vec(&descriptor) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("SECURITY: job submission {submitter}: descriptor encode failed ({e})");
+            return;
+        }
+    };
+    let desc_id: [u8; 32] = blake3::hash(&desc_json).into();
+    let pk_bytes = match jobfmt::from_hex(pubkey_hex, 32) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SECURITY: job submission {submitter}: bad pubkey ({e})");
+            return;
+        }
+    };
+    let sig_bytes = match jobfmt::from_hex(sig_hex, 64) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SECURITY: job submission {submitter}: bad signature ({e})");
+            return;
+        }
+    };
+    let vk = match VerifyingKey::from_bytes(&pk_bytes.try_into().unwrap()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("SECURITY: job submission {submitter}: bad pubkey ({e})");
+            return;
+        }
+    };
+    let msg = jobfmt::submission_message(&descriptor.job_id, &desc_id);
+    if let Err(e) = vk.verify(&msg, &Signature::from_bytes(&sig_bytes.try_into().unwrap())) {
+        eprintln!("SECURITY: job submission {submitter}: signature invalid ({e})");
+        return;
+    }
+
+    // Same confinement the file path enforces: the manifest's file
+    // fields and the job id must be plain names.
+    if let Err(e) = jobfmt::confined_name(&descriptor.job_id) {
+        eprintln!("SECURITY: job submission {submitter}: bad job id ({e})");
+        return;
+    }
+
+    // Land it in the watched directory. write_new avoids clobbering a
+    // concurrently-queued file with the same id.
+    let path = cfg
+        .jobs_dir
+        .join(format!("submitted-{ }.desc.json", descriptor.job_id));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            use std::io::Write;
+            if let Err(e) = f.write_all(&desc_json) {
+                let _ = std::fs::remove_file(&path);
+                eprintln!("SECURITY: job submission {submitter}: write failed ({e})");
+                return;
+            }
+        }
+        Err(e) => {
+            eprintln!("SECURITY: job submission {submitter}: queue failed ({e})");
+            return;
+        }
+    }
+    println!("job submitted by {submitter}: {} → {}", descriptor.job_id, path.display());
+    if let Some(c) = conns.lock().unwrap().get_mut(&conn) {
+        let _ = c.outbound.send(ServerToClient::SubmissionAck {
+            job_id: descriptor.job_id.clone(),
+            accepted: true,
+            reason: None,
+        });
+    }
+    if let Some(p) = pending.as_mut() {
+        // A submitter waiting on THIS job's outcome is registered —
+        // rare (resubmission of a running job) but harmless to track.
+        if p.descriptor.job_id == descriptor.job_id && !p.subscribers.contains(&conn) {
+            p.subscribers.push(conn);
+        }
+    }
+}
+
+/// The zk receipt-claim admission gate: exactly one claim attempt per/// The zk receipt-claim admission gate: exactly one claim attempt per
 /// dispatched worker per job. Returns false (and consumes nothing but
 /// the record of the attempt) when the worker has already claimed —
 /// a rejected or slow claim cannot be replayed to re-stall the
@@ -1084,6 +1272,21 @@ fn session_loop(
             }
             Ok(Some(ClientToServer::JobResult { result })) => {
                 tx.send(Event::Result { conn, result }).ok();
+            }
+            Ok(Some(ClientToServer::JobSubmission {
+                submitter,
+                descriptor,
+                pubkey_hex,
+                sig_hex,
+            })) => {
+                tx.send(Event::JobSubmission {
+                    conn,
+                    submitter,
+                    descriptor,
+                    pubkey_hex,
+                    sig_hex,
+                })
+                .ok();
             }
             Ok(Some(ClientToServer::ReceiptClaim {
                 worker_id,

@@ -37,6 +37,8 @@ fn main() {
         ledger: None,
         require_identity: true,
         identity_pow_bits: 0,
+        accept_submissions: false,
+        results_dir: None,
         zk: None,
         round1_ids: None,
         pool: Some(2),

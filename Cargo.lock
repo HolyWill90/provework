@@ -439,6 +439,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "jobkit"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "blake3",
+ "clap",
+ "contentstore",
+ "ed25519-dalek",
+ "jobfmt",
+ "rand_core",
+ "rvcore",
+ "serde_json",
+ "wire",
+]
+
+[[package]]
 name = "jobserver"
 version = "0.1.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"

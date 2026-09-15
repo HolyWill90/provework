@@ -160,6 +160,17 @@ pub enum ClientToServer {
     BlobRequest { id_hex: String },
     /// A completed, signed execution result.
     JobResult { result: jobfmt::WorkerResult },
+    /// A job owner submits a descriptor for execution. The connection
+    /// must be authenticated (same Hello/PoW/nonce flow as workers);
+    /// the signature is over `jobfmt::submission_message` — the job id
+    /// plus the descriptor's content id — binding the identity to the
+    /// exact submitted job.
+    JobSubmission {
+        submitter: String,
+        descriptor: contentstore::JobDescriptor,
+        pubkey_hex: String,
+        sig_hex: String,
+    },
     /// A zk receipt claim: the worker attaches a verified SP1 receipt
     /// for the whole job (hex of the bincode-serialized receipt). The
     /// signature is over `jobfmt::receipt_claim_message`.
@@ -197,6 +208,25 @@ pub enum ServerToClient {
     BetweenJobs,
     /// Final message: the session is over.
     ShutDown { reason: String },
+    /// Sent to a job submitter when the submitted job reaches a
+    /// decision: the accepted hash (or the judge's true hash), the
+    /// vindicated workers, the output, and whether a zk receipt
+    /// decided it.
+    JobOutcome {
+        job_id: String,
+        hash: String,
+        agreed: Vec<String>,
+        output_hex: Option<String>,
+        zk: bool,
+        rejected_reason: Option<String>,
+    },
+    /// Immediate reply to a JobSubmission: whether the descriptor
+    /// landed in the watched queue.
+    SubmissionAck {
+        job_id: String,
+        accepted: bool,
+        reason: Option<String>,
+    },
 }
 
 /// Direct worker-to-worker blob exchange (the p2p path). A daemon

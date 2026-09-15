@@ -161,6 +161,17 @@ pub fn receipt_claim_message(job_id: &str, receipt_hash: &[u8; 32]) -> Vec<u8> {
     m
 }
 
+/// The bytes a job submitter signs: length-prefixed job id plus the
+/// descriptor's content id. Binds the submitter's identity to the
+/// exact descriptor being queued.
+pub fn submission_message(job_id: &str, descriptor_id: &[u8; 32]) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.extend_from_slice(&(job_id.len() as u32).to_le_bytes());
+    m.extend_from_slice(job_id.as_bytes());
+    m.extend_from_slice(descriptor_id);
+    m
+}
+
 /// Hex decode failure: which string shape was rejected and why.
 #[derive(Debug)]
 pub enum HexError {

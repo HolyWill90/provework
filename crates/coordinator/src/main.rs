@@ -179,6 +179,15 @@ struct ServeArgs {
     /// verifying key from (sp1-artifacts/sp1-guest-emu.elf).
     #[arg(long)]
     zk_guest_elf: Option<PathBuf>,
+    /// Directory where each finished job's full outcome (decision,
+    /// results, ledger deltas) is persisted as {job_id}.json — the raw
+    /// material for evidence bundles. Required for `jobkit evidence`.
+    #[arg(long)]
+    results_dir: Option<PathBuf>,
+    /// Accept job descriptors over the wire from authenticated
+    /// submitters (enabled by default; disable for invite-only fleets).
+    #[arg(long, default_value_t = true)]
+    accept_submissions: bool,
     #[arg(long)]
     store: PathBuf,
     #[arg(long)]
@@ -222,6 +231,8 @@ fn cmd_serve(args: ServeArgs) {
         ledger: args.ledger,
         require_identity: true,
         identity_pow_bits: args.identity_pow_bits,
+        accept_submissions: args.accept_submissions,
+        results_dir: args.results_dir.clone(),
         zk: match (&args.zk_verify_cmd, &args.zk_guest_elf) {
             (Some(cmd), Some(elf)) => Some(net::ZkVerify {
                 cmd: cmd.clone(),
