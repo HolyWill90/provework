@@ -37,8 +37,30 @@ pub struct ZkJudge {
     pub timeout: Duration,
     /// When set, the receipt is saved to this directory as
     /// {job_id}.receipt.bin — the evidence bundle's third-party
-    /// checkable artifact.
+    /// checkable artifact. This is ALSO where the high-assurance
+    /// receipt cache lives ({receipt_dir}/zk-cache/).
     pub receipt_dir: Option<PathBuf>,
+    /// The standalone zk-verify binary: used to verify CACHED
+    /// receipts before a cache hit is trusted. Without it, cache
+    /// hits are refused and the job re-proves — a cache is never
+    /// trusted on faith.
+    pub verify_cmd: Option<String>,
+}
+
+/// The dedup key for high-assurance receipts: BLAKE3 over the
+/// descriptor's three content ids (manifest, elf, input) in fixed
+/// order. Deterministic execution means the same (program, input)
+/// always proves to the same receipt — so a second requester pays
+/// nothing for a receipt someone already paid for.
+pub fn receipt_cache_key(descriptor: &contentstore::JobDescriptor) -> String {
+    let mut material = Vec::new();
+    for id in [&descriptor.manifest, &descriptor.elf, &descriptor.input] {
+        let bytes =
+            jobfmt::from_hex(id, 32).expect("descriptor content ids are 32-byte hex");
+        material.extend_from_slice(&bytes);
+    }
+    let key: [u8; 32] = blake3::hash(&material).into();
+    hex(&key)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -64,16 +86,20 @@ pub struct JudgeVerdict {
 /// reads are capped and the invocation has a hard wall-clock limit.
 const MAX_VERDICT_BYTES: usize = 1024 * 1024;
 
-pub fn run_judge(cfg: &ZkJudge, job_dir: &Path, job_id: &str) -> Result<JudgeVerdict, String> {
+pub fn run_judge(
+    cfg: &ZkJudge,
+    job_dir: &Path,
+    receipt_out: Option<&Path>,
+) -> Result<JudgeVerdict, String> {
     let mut cmd = Command::new(&cfg.cmd);
     cmd.arg(job_dir)
         .arg(cfg.max_vm_cycles.to_string())
         .arg(&cfg.guest_elf);
-    if let Some(dir) = &cfg.receipt_dir {
-        std::fs::create_dir_all(dir).map_err(|e| format!("receipt dir: {e}"))?;
-        // A fixed per-job name is fine: one judge invocation per job,
-        // and the directory is the operator's, not attacker-writable.
-        cmd.arg(dir.join(format!("{job_id}.receipt.bin")));
+    if let Some(out) = receipt_out {
+        if let Some(dir) = out.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("receipt dir: {e}"))?;
+        }
+        cmd.arg(out);
     }
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
@@ -191,6 +217,47 @@ pub fn judge_decision(
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The receipt-cache layout under the configured receipt dir:
+/// `{dir}/zk-cache/{key}.receipt.bin` plus a `.json` sidecar with the
+/// prove metadata (proven_at, vm_cycles, proving_secs).
+pub fn cache_paths(receipt_dir: &Path, key: &str) -> (PathBuf, PathBuf) {
+    let dir = receipt_dir.join("zk-cache");
+    (
+        dir.join(format!("{key}.receipt.bin")),
+        dir.join(format!("{key}.verdict.json")),
+    )
+}
+
+/// Turn a cache lookup into a decision. A cache hit is only trusted
+/// after the SAME external verification a worker-submitted receipt
+/// claim goes through: the zk-verify binary re-derives the verifying
+/// key from the guest ELF and cryptographically checks the receipt
+/// against this job's binding. Anything else is treated as a miss.
+pub fn verify_cached(
+    zk: &ZkJudge,
+    receipt_dir: &Path,
+    key: &str,
+    expected_binding: &[[u8; 32]; 3],
+) -> Option<Decision> {
+    let Some(verify_cmd) = &zk.verify_cmd else { return None };
+    let (receipt_path, _) = cache_paths(receipt_dir, key);
+    let receipt_bytes = std::fs::read(&receipt_path).ok()?;
+    let outcome =
+        crate::receipt::verify_receipt(verify_cmd, &receipt_bytes, expected_binding, &zk.guest_elf)
+            .ok()?;
+    if outcome.status != 0 {
+        return None;
+    }
+    let output = jobfmt::from_hex(&outcome.output_hex, outcome.output_hex.len() / 2).ok()?;
+    let hash = hex(&jobfmt::journal_digest(outcome.instructions, &output));
+    Some(Decision::Accept {
+        hash,
+        output_hex: Some(outcome.output_hex),
+        agreed: Vec::new(),
+        zk: true,
+    })
 }
 
 #[cfg(test)]

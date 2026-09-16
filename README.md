@@ -57,6 +57,18 @@ cargo run --release -p jobkit -- submit my-job \
 # 5. evidence: assemble the verifier-ready bundle for the finished job
 cargo run --release -p jobkit -- evidence \
     --results <results-dir> --job-id my-job-0001 --out evidence-bundle
+
+#    zk-proved jobs ship a receipt; verify it offline — no coordinator,
+#    no prover (build the verifier once on any Linux machine:
+#    cargo build --release -p sp1-host --bins)
+cargo run --release -p jobkit -- verify --bundle evidence-bundle \
+    --zk-verify sp1-host/target/release/zk-verify \
+    --guest-elf elf/sp1-guest-emu --desc my-job/descriptor.json
+
+# 6. high-assurance mode: the coordinator proves the job in its zkVM
+#    and the outcome is receipt-backed — no worker consensus at all
+cargo run --release -p jobkit -- submit my-job --require-zk \
+    --server <coordinator-addr> --store ./p2pc-store --identity submitter.key
 ```
 
 ## Verification tiers

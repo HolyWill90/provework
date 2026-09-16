@@ -224,6 +224,21 @@ struct ServeArgs {
     tls: bool,
 }
 
+/// The zk judge config, shared by the dispute path and the
+/// high-assurance proving queue. `--zk-verify-cmd` (the standalone
+/// receipt verifier) doubles as the cache verifier: cached receipts
+/// are re-verified through it before use.
+fn zk_judge_cfg(args: &ServeArgs) -> Option<zk_judge::ZkJudge> {
+    Some(zk_judge::ZkJudge {
+        cmd: args.zk_judge_cmd.clone()?,
+        guest_elf: args.zk_judge_guest_elf.clone()?,
+        max_vm_cycles: args.zk_judge_max_vm_cycles,
+        timeout: std::time::Duration::from_secs(args.zk_judge_timeout_secs),
+        receipt_dir: args.results_dir.clone(),
+        verify_cmd: args.zk_verify_cmd.clone(),
+    })
+}
+
 fn cmd_serve(args: ServeArgs) {
     let bind: std::net::SocketAddr = args.bind.parse().expect("parse bind address");
     let args_tls = if args.tls {
@@ -248,6 +263,8 @@ fn cmd_serve(args: ServeArgs) {
         None
     };
     let (job_tx, job_rx) = std::sync::mpsc::channel();
+    // Judge config must be built before args is partially moved below.
+    let zk_cfg = zk_judge_cfg(&args);
     let cfg = net::ServeConfig {
         bind,
         jobs_dir: args.jobs_dir.clone(),
@@ -265,16 +282,11 @@ fn cmd_serve(args: ServeArgs) {
             }),
             _ => None,
         },
-        zk_judge: match (&args.zk_judge_cmd, &args.zk_judge_guest_elf) {
-            (Some(cmd), Some(elf)) => Some(zk_judge::ZkJudge {
-                cmd: cmd.clone(),
-                guest_elf: elf.clone(),
-                max_vm_cycles: args.zk_judge_max_vm_cycles,
-                timeout: std::time::Duration::from_secs(args.zk_judge_timeout_secs),
-                receipt_dir: args.results_dir.clone(),
-            }),
-            _ => None,
-        },
+        zk_judge: zk_cfg.clone(),
+        // The proving queue shares the dispute judge's config: a
+        // coordinator that can judge disputes can prove high-assurance
+        // jobs. Cache verification reuses the zk-verify binary.
+        zk_prover: zk_cfg,
         pool: Some(args.pool),
         round1_size: args.sample_size,
         round1_ids: args

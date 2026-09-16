@@ -70,6 +70,7 @@ fn multi_job_session_with_p2p_blob_exchange() {
         results_dir: None,
         zk: None,
         zk_judge: None,
+        zk_prover: None,
         round1_ids: None,
         pool: Some(2),
         round1_size: None,
@@ -245,6 +246,7 @@ fn tls_network_session() {
         results_dir: None,
         zk: None,
         zk_judge: None,
+        zk_prover: None,
         round1_ids: None,
         pool: Some(2),
         round1_size: None,
@@ -353,6 +355,7 @@ fn reserve_escalation_beats_lying_worker() {
         results_dir: None,
         zk: None,
         zk_judge: None,
+        zk_prover: None,
         pool: Some(3),
         round1_size: None,
         round1_ids: Some(vec!["wA".into(), "wB".into()]),
@@ -442,6 +445,7 @@ fn partial_descriptor_write_does_not_kill_server() {
         results_dir: None,
         zk: None,
         zk_judge: None,
+        zk_prover: None,
         pool: Some(1),
         round1_size: None,
         round1_ids: None,
@@ -590,6 +594,7 @@ fn net_security_cfg(
         results_dir: None,
         zk: None,
         zk_judge: None,
+        zk_prover: None,
         pool: Some(pool),
         round1_size: None,
         round1_ids: Some(round1),
@@ -704,6 +709,7 @@ fn duplicate_submissions_do_not_stuff_quorum() {
         results_dir: None,
         zk: None,
         zk_judge: None,
+        zk_prover: None,
         pool: Some(2),
         round1_size: None,
         round1_ids: Some(vec!["wA".into(), "wB".into()]),
@@ -811,6 +817,7 @@ fn zk_receipt_claim_accepts_job() {
             guest_elf: PathBuf::from(guest_elf),
         }),
         zk_judge: None,
+        zk_prover: None,
         pool: Some(1),
         round1_size: None,
         round1_ids: None,
@@ -890,6 +897,7 @@ fn dispute_judge_convicts_diverging_fabrications() {
         results_dir: None,
         zk: None,
         zk_judge: None,
+        zk_prover: None,
         pool: Some(2),
         round1_size: None,
         round1_ids: Some(vec!["wA".into(), "wB".into()]),
@@ -1004,7 +1012,9 @@ fn zk_judge_dispute_receipt_vindicates_honest_worker() {
             max_vm_cycles: 10_000_000,
             timeout: std::time::Duration::from_secs(900),
             receipt_dir: None,
+            verify_cmd: None,
         }),
+        zk_prover: None,
         pool: Some(2),
         round1_size: None,
         round1_ids: Some(vec!["wA".into(), "wB".into()]),
@@ -1060,4 +1070,197 @@ fn zk_judge_dispute_receipt_vindicates_honest_worker() {
     for h in handles {
         h.join().unwrap().unwrap();
     }
+}
+
+/// A minimal authenticated submitter client: Hello, PoW nonce, then
+/// the submission. Returns the open stream after the ack round-trip.
+fn connect_submitter(
+    addr: &str,
+    key: &ed25519_dalek::SigningKey,
+    require_zk: bool,
+    descriptor: &contentstore::JobDescriptor,
+) -> std::net::TcpStream {
+    use ed25519_dalek::Signer;
+    use wire::{ClientToServer, ServerToClient};
+    let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+    wire::send(
+        &mut stream,
+        &ClientToServer::Hello {
+            pubkey_hex: hex(&key.verifying_key().to_bytes()),
+            worker_id: "submitter".into(),
+            listen_port: None,
+        },
+    )
+    .unwrap();
+    let wire::ServerToClient::Nonce { hex: nonce_hex, pow_bits } =
+        wire::receive::<ServerToClient>(&mut stream).unwrap()
+    else {
+        panic!("expected nonce");
+    };
+    let nonce_bytes = jobfmt::from_hex(&nonce_hex, nonce_hex.len() / 2).unwrap();
+    wire::send(
+        &mut stream,
+        &ClientToServer::NonceSignature {
+            sig_hex: Some(hex(&key.sign(&nonce_bytes).to_bytes())),
+            pow_counter: wire::mine_pow(&nonce_bytes, pow_bits),
+        },
+    )
+    .unwrap();
+    let wire::ServerToClient::AuthOk { .. } =
+        wire::receive::<ServerToClient>(&mut stream).unwrap()
+    else {
+        panic!("expected auth ok");
+    };
+    // The coordinator hashes the canonical descriptor JSON with blake3
+    // and checks the signature over submission_message(job_id, id).
+    let desc_json = serde_json::to_vec(descriptor).unwrap();
+    let desc_id: [u8; 32] = blake3::hash(&desc_json).into();
+    let msg = jobfmt::submission_message(&descriptor.job_id, &desc_id);
+    wire::send(
+        &mut stream,
+        &ClientToServer::JobSubmission {
+            submitter: descriptor.job_id.clone(),
+            descriptor: descriptor.clone(),
+            pubkey_hex: hex(&key.verifying_key().to_bytes()),
+            sig_hex: hex(&key.sign(&msg).to_bytes()),
+            require_zk,
+        },
+    )
+    .unwrap();
+    stream
+}
+
+/// High-assurance proving queue, end to end with deduplication: two
+/// submissions of the SAME content (different job ids) — the first is
+/// proven fresh, the second is served from the receipt cache after the
+/// cached receipt re-verifies. Gated on the zk-judge + zk-verify
+/// binaries (CI: SP1_PROVER=mock; container: real prover).
+#[test]
+fn zk_proving_queue_end_to_end_with_dedup() {
+    let Ok(judge_cmd) = std::env::var("P2PC_ZK_JUDGE_CMD") else {
+        eprintln!("SKIP: P2PC_ZK_JUDGE_CMD not set (build sp1-host/zk-judge)");
+        return;
+    };
+    let Ok(guest_elf) = std::env::var("P2PC_ZK_JUDGE_GUEST_ELF") else {
+        eprintln!("SKIP: P2PC_ZK_JUDGE_GUEST_ELF not set");
+        return;
+    };
+    let Ok(verify_cmd) = std::env::var("P2PC_ZK_VERIFY") else {
+        eprintln!("SKIP: P2PC_ZK_VERIFY not set (cache verification disabled)");
+        return;
+    };
+    if !Path::new(&judge_cmd).exists()
+        || !Path::new(&guest_elf).exists()
+        || !Path::new(&verify_cmd).exists()
+    {
+        eprintln!("SKIP: zk binaries or guest ELF missing");
+        return;
+    }
+    if !Path::new("../../jobs/demo-hash-nano/program.elf").exists() {
+        eprintln!("SKIP: jobs/demo-hash-nano/program.elf missing");
+        return;
+    }
+    let root = temp_dir("p2pc-net-zkprove");
+    let store_dir = root.join("store");
+    let results = root.join("results");
+    std::fs::create_dir_all(root.join("jobs")).unwrap();
+    let store = contentstore::Store::open(&store_dir).unwrap();
+    let desc1 = contentstore::publish(&PathBuf::from("../../jobs/demo-hash-nano"), &store).unwrap();
+
+    let (bound_tx, bound_rx) = channel();
+    let (job_tx, job_rx) = channel::<JobOutcome>();
+    let cfg = net::ServeConfig {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        jobs_dir: root.join("jobs"),
+        store_dir: store_dir.clone(),
+        per_job_deadline: std::time::Duration::from_secs(90),
+        ledger: None,
+        require_identity: true,
+        identity_pow_bits: 8,
+        accept_submissions: true,
+        results_dir: Some(results.clone()),
+        zk: None,
+        zk_judge: None,
+        zk_prover: Some(coordinator::zk_judge::ZkJudge {
+            cmd: judge_cmd,
+            guest_elf: PathBuf::from(&guest_elf),
+            max_vm_cycles: 10_000_000,
+            timeout: std::time::Duration::from_secs(900),
+            receipt_dir: Some(results.clone()),
+            verify_cmd: Some(verify_cmd),
+        }),
+        pool: None,
+        round1_size: None,
+        round1_ids: None,
+        tls: None,
+        bound_tx: Some(bound_tx),
+        max_jobs: None,
+        job_tx: Some(job_tx),
+    };
+    std::thread::spawn(move || net::serve(cfg).expect("serve"));
+    let bound = bound_rx.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+    let addr = bound.to_string();
+
+    let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+
+    // Submission 1: fresh prove (mock: instant; real: ~140 s).
+    let mut d1 = desc1.clone();
+    d1.job_id = "zkjob-0001".into();
+    let mut stream = connect_submitter(&addr, &key, true, &d1);
+    let wire::ServerToClient::SubmissionAck { accepted, proving, .. } =
+        wire::receive::<wire::ServerToClient>(&mut stream).unwrap()
+    else {
+        panic!("expected ack");
+    };
+    assert!(accepted, "submission 1 accepted");
+    assert!(proving, "submission 1 goes to the proving queue");
+    let wire::ServerToClient::JobOutcome { zk, hash, .. } =
+        wire::receive::<wire::ServerToClient>(&mut stream).unwrap()
+    else {
+        panic!("expected outcome 1");
+    };
+    assert!(zk, "outcome 1 is receipt-backed");
+    let outcome1 = wait_job(&job_rx);
+    let coordinator::Decision::Accept { hash: h1, zk: z1, .. } = &outcome1.decision else {
+        panic!("job 1 should accept, got {:?}", outcome1.decision);
+    };
+    assert!(*z1);
+    assert_eq!(&hash, h1);
+
+    // The receipt + verdict sidecar are in the content-keyed cache.
+    let (r1, m1) = coordinator::zk_judge::cache_paths(&results, "KEY");
+    let cache_dir = r1.parent().unwrap().to_path_buf();
+    let entries: Vec<_> = std::fs::read_dir(&cache_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(entries.len(), 2, "one receipt + one sidecar: {entries:?}");
+    let _ = m1;
+
+    // Submission 2: same content, different job id — must be a cache
+    // hit (identical result hash, no second proof: still exactly one
+    // receipt in the cache).
+    let mut d2 = desc1.clone();
+    d2.job_id = "zkjob-0002".into();
+    let mut stream2 = connect_submitter(&addr, &key, true, &d2);
+    let wire::ServerToClient::SubmissionAck { accepted, proving, .. } =
+        wire::receive::<wire::ServerToClient>(&mut stream2).unwrap()
+    else {
+        panic!("expected ack 2");
+    };
+    assert!(accepted && proving, "submission 2 accepted to the queue");
+    let wire::ServerToClient::JobOutcome { zk: zk2, hash: hash2, .. } =
+        wire::receive::<wire::ServerToClient>(&mut stream2).unwrap()
+    else {
+        panic!("expected outcome 2");
+    };
+    assert!(zk2, "outcome 2 is receipt-backed");
+    assert_eq!(hash2, hash, "identical content proves to the identical result");
+    let entries2: Vec<_> = std::fs::read_dir(&cache_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(entries2.len(), 2, "cache served job 2 without a new proof: {entries2:?}");
 }

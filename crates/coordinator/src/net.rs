@@ -45,6 +45,11 @@ pub struct ServeConfig {
     /// external SP1 prover process before falling back to the replay
     /// judge. The receipt makes the verdict third-party checkable.
     pub zk_judge: Option<crate::zk_judge::ZkJudge>,
+    /// High-assurance proving queue: when set, submissions with
+    /// `require_zk` skip worker consensus and are proven directly
+    /// (queued, not synchronous). Uses the same judge config as the
+    /// dispute path.
+    pub zk_prover: Option<crate::zk_judge::ZkJudge>,
     /// When true, authenticated connections may submit job descriptors
     /// over the wire; each lands in the watched jobs directory.
     pub accept_submissions: bool,
@@ -104,6 +109,7 @@ enum Event {
         descriptor: contentstore::JobDescriptor,
         pubkey_hex: String,
         sig_hex: String,
+        require_zk: bool,
     },
     ReceiptClaim {
         conn: usize,
@@ -116,6 +122,11 @@ enum Event {
     BlobRequest { conn: usize, id: String },
     Result { conn: usize, result: WorkerResult },
     Closed { conn: usize },
+    /// A high-assurance (require_zk) job finished in the proving
+    /// queue: the worker thread delivers the job with its
+    /// receipt-backed (or failed) decision. Runs through the same
+    /// finish path as consensus jobs.
+    Proved { job: PendingJob, decision: Decision },
 }
 
 struct Conn {
@@ -130,6 +141,7 @@ struct Conn {
     peer_ip: String,
 }
 
+#[derive(Debug)]
 struct PendingJob {
     descriptor: contentstore::JobDescriptor,
     /// Worker ids targeted (None = all authenticated workers).
@@ -165,6 +177,19 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
 
     let (event_tx, event_rx) = channel::<Event>();
     let conns: Arc<Mutex<HashMap<usize, Conn>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    // High-assurance proving queue: one worker thread pops require_zk
+    // submissions and delivers receipt-backed decisions as events. The
+    // submitter's connection is never blocked by proving time.
+    let prove_tx = if let Some(zk) = cfg.zk_prover.clone() {
+        let (task_tx, task_rx) = channel::<PendingJob>();
+        let ev = event_tx.clone();
+        let store_dir = cfg.store_dir.clone();
+        std::thread::spawn(move || proving_worker(task_rx, ev, store_dir, zk));
+        Some(task_tx)
+    } else {
+        None
+    };
 
     // Acceptor: each incoming connection gets a session thread that
     // owns the stream exclusively (polled receive + outbound queue) —
@@ -491,7 +516,6 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
             }
         }
         if let Some(job) = job_finished {
-            let job_id = job.descriptor.job_id.clone();
             let decision = match job.zk_accept.clone() {
                 Some(d) => d, // a verified zk receipt needs no consensus
                 None => match decide(&job.results, job.dispatched_ids.len()) {
@@ -519,59 +543,8 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
                     other => other,
                 },
             };
-            eprintln!(
-                "[net] job finished: {} results, dispatched [{}], reserves [{}], decision {:?}",
-                job.results.len(),
-                job.dispatched_ids.join(","),
-                job.reserves.join(","),
-                decision
-            );
-            let deltas = slashing(&decision, &job.results);
-
-            // Notify remote submitters waiting on this job.
-            if let Decision::Accept { hash, agreed, output_hex, zk } = &decision {
-                let notice = ServerToClient::JobOutcome {
-                    job_id: job_id.clone(),
-                    hash: hash.clone(),
-                    agreed: agreed.clone(),
-                    output_hex: output_hex.clone(),
-                    zk: *zk,
-                    rejected_reason: None,
-                };
-                for &conn in &job.subscribers {
-                    if let Some(c) = conns.lock().unwrap().get(&conn) {
-                        let _ = c.outbound.send(notice.clone());
-                    }
-                }
-            }
-
-            // Evidence raw material: persist the full outcome for the
-            // evidence-bundle assembler.
-            if let Some(rd) = &cfg.results_dir {
-                let _ = std::fs::create_dir_all(rd);
-                let record = serde_json::json!({
-                    "job_id": job_id,
-                    "decision": decision,
-                    "results": job.results,
-                    "ledger_deltas": deltas,
-                });
-                let _ = std::fs::write(
-                    rd.join(format!("{job_id}.json")),
-                    serde_json::to_vec_pretty(&record).unwrap_or_default(),
-                );
-            }
-            finish_ledger(&cfg, &job_id, &decision, &deltas);
-            let outcome = JobOutcome {
-                job_id: job_id.clone(),
-                decision: decision.clone(),
-                results: job.results,
-                bond_deltas: deltas,
-            };
-            if let Some(tx) = &cfg.job_tx {
-                tx.send(outcome.clone()).ok();
-            }
-            outcomes.push(outcome);
-            jobs_done += 1;
+            // Shared finish path: notify, persist, ledger, count.
+            finish_decided_job(&cfg, &conns, &job, &decision, &mut outcomes, &mut jobs_done);
             let mut done = job.path.clone().into_os_string();
             done.push(".done");
             std::fs::rename(&job.path, done).ok();
@@ -755,10 +728,11 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
                 descriptor,
                 pubkey_hex,
                 sig_hex,
+                require_zk,
             } => {
                 handle_job_submission(
                     &cfg, &conns, &mut pending, conn, &submitter, descriptor,
-                    &pubkey_hex, &sig_hex,
+                    &pubkey_hex, &sig_hex, require_zk, prove_tx.as_ref(),
                 );
             }
             Event::ReceiptClaim {
@@ -799,6 +773,13 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
                     &cfg, &mut pending, &worker_id, &job_id, &pubkey_hex, &sig_hex,
                     &receipt_hex,
                 );
+            }
+            Event::Proved { job, decision } => {
+                // The proving queue bypasses the pending slot: the job
+                // never dispatched to workers, so there is no watched
+                // descriptor file to mark done — just finish it.
+                finish_decided_job(&cfg, &conns, &job, &decision, &mut outcomes, &mut jobs_done);
+                broadcast_between_jobs(&conns);
             }
             Event::Closed { conn } => {
                 let wid = conns.lock().unwrap().get(&conn).map(|c| c.worker_id.clone());
@@ -978,7 +959,11 @@ fn zk_judge_network(
     ));
     let _ = std::fs::remove_dir_all(&dir);
     contentstore::materialize(&job.descriptor, store, &dir).ok()?;
-    let result = crate::zk_judge::run_judge(zk, &dir, &job.descriptor.job_id)
+    let receipt_out = zk
+        .receipt_dir
+        .as_ref()
+        .map(|rd| rd.join(format!("{}.receipt.bin", job.descriptor.job_id)));
+    let result = crate::zk_judge::run_judge(zk, &dir, receipt_out.as_deref())
         .and_then(|verdict| {
             // The descriptor's content ids are plain hex; decode each
             // and require exactly 32 bytes (the content store's ids).
@@ -1025,6 +1010,172 @@ fn zk_judge_network(
     }
 }
 
+/// Decode a 32-byte hex content id (plain hex, exactly 64 chars).
+fn decode_hex32(h: &str) -> Result<[u8; 32], String> {
+    let bytes = jobfmt::from_hex(h, 32).map_err(|e| format!("content id: {e}"))?;
+    bytes
+        .try_into()
+        .map_err(|_| "content id length".to_string())
+}
+
+/// The shared tail of every finished job — consensus, judged, or
+/// zk-proved: notify subscribers, persist the evidence record, apply
+/// ledger deltas, and hand the outcome to the caller-side collector.
+fn finish_decided_job(
+    cfg: &ServeConfig,
+    conns: &Arc<Mutex<HashMap<usize, Conn>>>,
+    job: &PendingJob,
+    decision: &Decision,
+    outcomes: &mut Vec<JobOutcome>,
+    jobs_done: &mut usize,
+) {
+    let job_id = job.descriptor.job_id.clone();
+    eprintln!(
+        "[net] job finished: {} results, dispatched [{}], reserves [{}], decision {:?}",
+        job.results.len(),
+        job.dispatched_ids.join(","),
+        job.reserves.join(","),
+        decision
+    );
+    let deltas = slashing(decision, &job.results);
+
+    // Notify remote submitters waiting on this job.
+    if let Decision::Accept { hash, agreed, output_hex, zk } = decision {
+        let notice = ServerToClient::JobOutcome {
+            job_id: job_id.clone(),
+            hash: hash.clone(),
+            agreed: agreed.clone(),
+            output_hex: output_hex.clone(),
+            zk: *zk,
+            rejected_reason: None,
+        };
+        for &conn in &job.subscribers {
+            if let Some(c) = conns.lock().unwrap().get(&conn) {
+                let _ = c.outbound.send(notice.clone());
+            }
+        }
+    }
+
+    // Evidence raw material: persist the full outcome for the
+    // evidence-bundle assembler.
+    if let Some(rd) = &cfg.results_dir {
+        let _ = std::fs::create_dir_all(rd);
+        let record = serde_json::json!({
+            "job_id": job_id,
+            "decision": decision,
+            "results": job.results,
+            "ledger_deltas": deltas,
+        });
+        let _ = std::fs::write(
+            rd.join(format!("{job_id}.json")),
+            serde_json::to_vec_pretty(&record).unwrap_or_default(),
+        );
+    }
+    finish_ledger(cfg, &job_id, decision, &deltas);
+    let outcome = JobOutcome {
+        job_id: job_id.clone(),
+        decision: decision.clone(),
+        results: job.results.clone(),
+        bond_deltas: deltas,
+    };
+    if let Some(tx) = &cfg.job_tx {
+        tx.send(outcome.clone()).ok();
+    }
+    outcomes.push(outcome);
+    *jobs_done += 1;
+}
+
+/// The high-assurance proving queue worker: pops require_zk jobs,
+/// materializes them from the store, and runs the zk-judge process.
+/// A fresh proof lands in the receipt cache; a cache hit (same
+/// manifest+elf+input already proven) is verified through the
+/// standalone verifier and served without proving again. Deterministic
+/// execution makes receipts for identical jobs identical, so the
+/// second requester never pays for the first one's proof.
+fn proving_worker(
+    rx: Receiver<PendingJob>,
+    event_tx: Sender<Event>,
+    store_dir: PathBuf,
+    zk: crate::zk_judge::ZkJudge,
+) {
+    let Ok(store) = contentstore::Store::open(&store_dir) else {
+        eprintln!("[net] proving queue: cannot open store — queue disabled");
+        return;
+    };
+    while let Ok(job) = rx.recv() {
+        let job_id = job.descriptor.job_id.clone();
+        let decision = match prove_one(&store, &zk, &job) {
+            Ok(d) => d,
+            Err(e) => Decision::Reject {
+                reason: format!("zk proving failed: {e}"),
+            },
+        };
+        eprintln!("[net] proving queue finished {job_id}: {decision:?}");
+        event_tx.send(Event::Proved { job, decision }).ok();
+    }
+}
+
+fn prove_one(
+    store: &contentstore::Store,
+    zk: &crate::zk_judge::ZkJudge,
+    job: &PendingJob,
+) -> Result<Decision, String> {
+    let dir = std::env::temp_dir().join(format!(
+        "p2pc-zkprove-{}-{}",
+        std::process::id(),
+        job.descriptor.job_id
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    contentstore::materialize(&job.descriptor, store, &dir)?;
+    let expected_binding = [
+        decode_hex32(&job.descriptor.manifest)?,
+        decode_hex32(&job.descriptor.elf)?,
+        decode_hex32(&job.descriptor.input)?,
+    ];
+    // Dedup first: an already-proven (manifest, elf, input) is served
+    // from the cache after the receipt re-verifies against THIS job's
+    // binding — never trusted on faith.
+    let key = crate::zk_judge::receipt_cache_key(&job.descriptor);
+    if let Some(rd) = &zk.receipt_dir {
+        if let Some(d) = crate::zk_judge::verify_cached(zk, rd, &key, &expected_binding) {
+            eprintln!("[net] zk receipt cache hit for {} (key {key})", job.descriptor.job_id);
+            let _ = std::fs::remove_dir_all(&dir);
+            return Ok(d);
+        }
+    }
+    // Fresh prove: the receipt lands in the cache keyed by content.
+    let receipt_out = zk
+        .receipt_dir
+        .as_ref()
+        .map(|rd| crate::zk_judge::cache_paths(rd, &key).0);
+    let verdict = crate::zk_judge::run_judge(zk, &dir, receipt_out.as_deref())?;
+    let _ = std::fs::remove_dir_all(&dir);
+    // Sidecar: the prove metadata for operators and tests.
+    if let (Some(rd), Some(path)) = (&zk.receipt_dir, receipt_out.as_ref()) {
+        if path.exists() {
+            let meta = serde_json::json!({
+                "key": key,
+                "job_id": job.descriptor.job_id,
+                "proven_at": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                "instructions": verdict.instructions,
+                "output_hex": verdict.output_hex,
+                "vm_cycles": verdict.vm_cycles,
+                "proving_secs": verdict.proving_secs,
+            });
+            let (_, meta_path) = crate::zk_judge::cache_paths(rd, &key);
+            let _ = std::fs::write(meta_path, serde_json::to_vec_pretty(&meta).unwrap_or_default());
+            // Per-job evidence copy: the evidence assembler picks the
+            // receipt up by job id, not by cache key.
+            let _ = std::fs::create_dir_all(rd);
+            let _ = std::fs::copy(path, rd.join(format!("{}.receipt.bin", job.descriptor.job_id)));
+        }
+    }
+    crate::zk_judge::judge_decision(&verdict, &expected_binding)
+}
+
 /// Validate and land a remotely submitted job descriptor. The
 /// connection must be authenticated (same Hello/PoW/nonce flow as
 /// workers), the signature must bind the submitter's identity to the
@@ -1032,6 +1183,7 @@ fn zk_judge_network(
 /// confinement rules the file path enforces. Accepted submissions are
 /// written into the watched jobs directory — the existing scanner
 /// picks them up exactly like hand-dropped files.
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn handle_job_submission(
     cfg: &ServeConfig,
@@ -1042,6 +1194,8 @@ fn handle_job_submission(
     descriptor: contentstore::JobDescriptor,
     pubkey_hex: &str,
     sig_hex: &str,
+    require_zk: bool,
+    prove_tx: Option<&Sender<PendingJob>>,
 ) {
     if !cfg.accept_submissions {
         eprintln!("SECURITY: job submission from {submitter} dropped — submissions disabled");
@@ -1108,6 +1262,54 @@ fn handle_job_submission(
         return;
     }
 
+    // High-assurance mode: skip worker consensus entirely. The job
+    // goes to the proving queue; the ack returns immediately and the
+    // JobOutcome arrives when the proof (or the cache hit) lands.
+    if require_zk {
+        let Some(tx) = prove_tx else {
+            if let Some(c) = conns.lock().unwrap().get_mut(&conn) {
+                let _ = c.outbound.send(ServerToClient::SubmissionAck {
+                    job_id: descriptor.job_id.clone(),
+                    accepted: false,
+                    reason: Some(
+                        "coordinator does not run a zk prover — high-assurance submissions refused"
+                            .into(),
+                    ),
+                    proving: false,
+                });
+            }
+            return;
+        };
+        let job = PendingJob {
+            descriptor: descriptor.clone(),
+            targets: None,
+            path: cfg.jobs_dir.join("zk-proving"),
+            dispatched: true,
+            escalated: false,
+            dispatched_ids: Vec::new(),
+            reserves: Vec::new(),
+            results: Vec::new(),
+            started: std::time::Instant::now(),
+            zk_accept: None,
+            receipt_claimed: Vec::new(),
+            subscribers: vec![conn],
+        };
+        if tx.send(job).is_err() {
+            eprintln!("SECURITY: proving queue unavailable — submission dropped");
+            return;
+        }
+        println!("job submitted by {submitter}: {} → zk proving queue", descriptor.job_id);
+        if let Some(c) = conns.lock().unwrap().get_mut(&conn) {
+            let _ = c.outbound.send(ServerToClient::SubmissionAck {
+                job_id: descriptor.job_id.clone(),
+                accepted: true,
+                reason: None,
+                proving: true,
+            });
+        }
+        return;
+    }
+
     // Land it in the watched directory. write_new avoids clobbering a
     // concurrently-queued file with the same id.
     let path = cfg
@@ -1137,6 +1339,7 @@ fn handle_job_submission(
             job_id: descriptor.job_id.clone(),
             accepted: true,
             reason: None,
+            proving: false,
         });
     }
     if let Some(p) = pending.as_mut() {
@@ -1357,6 +1560,7 @@ fn session_loop(
                 descriptor,
                 pubkey_hex,
                 sig_hex,
+                require_zk,
             })) => {
                 tx.send(Event::JobSubmission {
                     conn,
@@ -1364,6 +1568,7 @@ fn session_loop(
                     descriptor,
                     pubkey_hex,
                     sig_hex,
+                    require_zk,
                 })
                 .ok();
             }
