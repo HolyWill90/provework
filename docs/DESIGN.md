@@ -503,6 +503,48 @@ zkVM through the same external zk-judge process the dispute path uses.
   without a prover is refused with a clear reason, not silently
   downgraded to consensus.
 
+## V2 guest format: SP1-native jobs (the ABI trampoline, honestly scoped)
+
+The ~300x meta-emulation tax of the emulator-in-a-zkVM bootstrap was
+the system's structural cost floor. V2 removes it for NEW jobs: a job
+crate compiled against an SP1-native ABI stub (reads input via
+`sp1_zkvm::io::read`, commits `blake3(input)` then the output) runs
+DIRECTLY on the zkVM — the emulator is out of the loop entirely.
+
+Honest scoping: the trampoline is source-level, not binary-level. A
+legacy ELF's stores to fixed addresses cannot be intercepted under
+SP1 (no trap-and-emulate hook for guest stores), so legacy jobs keep
+the emulator path indefinitely; V2 is the format new jobs opt into
+via the manifest's `format: "sp1-v2"` field.
+
+**Measured, same job and input (demo fold over 32 KiB):**
+
+| | VM cycles | CPU prove | peak RAM |
+|---|---|---|---|
+| legacy (emulator-in-guest) | 168,881,446 | OOM-killed at 32 GB | — |
+| **V2 (SP1-native)** | **1,789,276** | **80.5 s** | **15.7 GB** |
+
+94x fewer cycles; the job that could not be proven at all now proves
+on an ordinary 32 GB host in 80 seconds. The V2 output is
+byte-identical to the legacy rvcore result for the same input — the
+differential the network test asserts.
+
+Design consequences, all deliberate:
+
+- **The V2 journal binds the output only** (`journal(0, output)`):
+  SP1 cycle counts are a compiler/SDK-version artifact, not
+  architectural state, and pinning them into the consensus digest
+  would make receipts version-fragile.
+- **The rvcore replay judge REFUSES V2 jobs** rather than mis-parsing
+  them as rv-abi ELFs (a "replay" would fabricate garbage truth).
+  V2 disputes and V2 high-assurance proving are the zk judge's
+  exclusive jurisdiction; workers without the sp1 feature refuse V2
+  assignments with an explicit error.
+- **V2 receipts bind the input id** (committed by the guest; the elf
+  is bound by the verifying key; the manifest is not executed), and
+  the verifier checks exactly that — the "this receipt is for MY
+  job" property survives the format change.
+
 ## Known gaps (next milestones)
 
 1. Official `riscv-arch-test` suite (the full official riscv-tests

@@ -1264,3 +1264,106 @@ fn zk_proving_queue_end_to_end_with_dedup() {
         .collect();
     assert_eq!(entries2.len(), 2, "cache served job 2 without a new proof: {entries2:?}");
 }
+
+/// V2 (SP1-native) jobs through the proving queue: the committed
+/// demo-v2 ELF is executed DIRECTLY by SP1 — no emulator in the
+/// middle. Gated on the zk binaries (CI: mock prover; container:
+/// real). The output must equal the legacy rvcore path's output for
+/// the same input — the V2-vs-legacy differential.
+#[test]
+fn zk_proving_queue_v2_native_job() {
+    let Ok(judge_cmd) = std::env::var("P2PC_ZK_JUDGE_CMD") else {
+        eprintln!("SKIP: P2PC_ZK_JUDGE_CMD not set");
+        return;
+    };
+    let Ok(guest_elf) = std::env::var("P2PC_ZK_JUDGE_GUEST_ELF") else {
+        eprintln!("SKIP: P2PC_ZK_JUDGE_GUEST_ELF not set");
+        return;
+    };
+    let Ok(verify_cmd) = std::env::var("P2PC_ZK_VERIFY") else {
+        eprintln!("SKIP: P2PC_ZK_VERIFY not set");
+        return;
+    };
+    if !Path::new(&judge_cmd).exists() || !Path::new(&guest_elf).exists() {
+        eprintln!("SKIP: zk binaries or guest ELF missing");
+        return;
+    }
+    // The V2 demo's program.elf is a committed artifact (SP1-native);
+    // no SP1 toolchain is needed to run this test.
+    if !Path::new("../../jobs/demo-v2/program.elf").exists() {
+        eprintln!("SKIP: jobs/demo-v2/program.elf missing");
+        return;
+    }
+    let root = temp_dir("p2pc-net-zkprove-v2");
+    let store_dir = root.join("store");
+    let results = root.join("results");
+    std::fs::create_dir_all(root.join("jobs")).unwrap();
+    let store = contentstore::Store::open(&store_dir).unwrap();
+    let desc = contentstore::publish(&PathBuf::from("../../jobs/demo-v2"), &store).unwrap();
+
+    let (bound_tx, bound_rx) = channel();
+    let (job_tx, job_rx) = channel::<JobOutcome>();
+    let cfg = net::ServeConfig {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        jobs_dir: root.join("jobs"),
+        store_dir: store_dir.clone(),
+        per_job_deadline: std::time::Duration::from_secs(90),
+        ledger: None,
+        require_identity: true,
+        identity_pow_bits: 8,
+        accept_submissions: true,
+        results_dir: Some(results.clone()),
+        zk: None,
+        zk_judge: None,
+        zk_prover: Some(coordinator::zk_judge::ZkJudge {
+            cmd: judge_cmd,
+            guest_elf: PathBuf::from(&guest_elf),
+            // V2 is native: 1.79M VM cycles for the 32 KiB demo —
+            // ~94x less than the meta-emulated equivalent.
+            max_vm_cycles: 10_000_000,
+            timeout: std::time::Duration::from_secs(900),
+            receipt_dir: Some(results.clone()),
+            verify_cmd: Some(verify_cmd),
+        }),
+        pool: None,
+        round1_size: None,
+        round1_ids: None,
+        tls: None,
+        bound_tx: Some(bound_tx),
+        max_jobs: None,
+        job_tx: Some(job_tx),
+    };
+    std::thread::spawn(move || net::serve(cfg).expect("serve"));
+    let bound = bound_rx.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+    let addr = bound.to_string();
+
+    let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let mut stream = connect_submitter(&addr, &key, true, &desc);
+    let wire::ServerToClient::SubmissionAck { accepted, proving, .. } =
+        wire::receive::<wire::ServerToClient>(&mut stream).unwrap()
+    else {
+        panic!("expected ack");
+    };
+    assert!(accepted && proving, "v2 submission goes to the proving queue");
+    let wire::ServerToClient::JobOutcome { zk, hash, output_hex, .. } =
+        wire::receive::<wire::ServerToClient>(&mut stream).unwrap()
+    else {
+        panic!("expected outcome");
+    };
+    assert!(zk, "v2 outcome is receipt-backed");
+    // The V2-vs-legacy differential: the native program's output for
+    // the same input equals the legacy rvcore result byte-for-byte.
+    assert_eq!(
+        output_hex.as_deref(),
+        Some("25a3ab01295a23ff5e515691acd1e06a1d2b56ee38d4dedfd46959725714c5e5"),
+        "v2 native output must equal the legacy rvcore output"
+    );
+    let outcome = wait_job(&job_rx);
+    let coordinator::Decision::Accept { hash: h, zk: z, output_hex: o, .. } = &outcome.decision
+    else {
+        panic!("v2 job should accept, got {:?}", outcome.decision);
+    };
+    assert!(z);
+    assert_eq!(&hash, h);
+    assert_eq!(o.as_deref(), Some("25a3ab01295a23ff5e515691acd1e06a1d2b56ee38d4dedfd46959725714c5e5"));
+}

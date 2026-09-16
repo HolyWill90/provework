@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "id": "demo-v2-0001",
+  "name": "demo-v2",
+  "isa": "rv64imc",
+  "format": "sp1-v2",
+  "toolchain": "sp1 6.8.0 (riscv64im-succinct-zkvm-elf)",
+  "chunk_size": 1048576,
+  "max_instructions": 1000000000,
+  "verification_class": "quorum3",
+  "elf": "program.elf",
+  "input": "input.bin"
+}

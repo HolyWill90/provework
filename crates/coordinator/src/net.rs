@@ -911,6 +911,17 @@ fn judge_by_replay_network(
     contentstore::materialize(&job.descriptor, store, &dir).ok()?;
     let manifest_bytes = std::fs::read(dir.join("job.json")).ok()?;
     let manifest: jobfmt::JobManifest = serde_json::from_slice(&manifest_bytes).ok()?;
+    if manifest.is_sp1_v2() {
+        // rvcore cannot execute an SP1-native ELF — a "replay" would
+        // fabricate garbage truth. V2 disputes are the zk judge's
+        // exclusive jurisdiction.
+        eprintln!(
+            "[net] replay judge cannot arbitrate v2 job {} — requires the zk judge",
+            job.descriptor.job_id
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        return None;
+    }
     let elf = std::fs::read(dir.join(&manifest.elf)).ok()?;
     let input = std::fs::read(dir.join(&manifest.input)).ok()?;
     let image = rvcore::elf::parse(&elf).ok()?;
@@ -976,7 +987,11 @@ fn zk_judge_network(
                 decode32(&job.descriptor.elf)?,
                 decode32(&job.descriptor.input)?,
             ];
-            crate::zk_judge::judge_decision(&verdict, &expected_binding)
+            let manifest_bytes = std::fs::read(dir.join("job.json"))
+                .map_err(|e| format!("manifest: {e}"))?;
+            let manifest: jobfmt::JobManifest =
+                serde_json::from_slice(&manifest_bytes).map_err(|e| format!("manifest: {e}"))?;
+            crate::zk_judge::judge_decision(&verdict, &expected_binding, manifest.is_sp1_v2())
         });
     let _ = std::fs::remove_dir_all(&dir);
     match result {
@@ -1132,12 +1147,19 @@ fn prove_one(
         decode_hex32(&job.descriptor.elf)?,
         decode_hex32(&job.descriptor.input)?,
     ];
+    // The format decides the judge mode and the journal basis.
+    let manifest_bytes =
+        std::fs::read(dir.join("job.json")).map_err(|e| format!("manifest: {e}"))?;
+    let manifest: jobfmt::JobManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|e| format!("manifest parse: {e}"))?;
+    let v2 = manifest.is_sp1_v2();
+
     // Dedup first: an already-proven (manifest, elf, input) is served
     // from the cache after the receipt re-verifies against THIS job's
     // binding — never trusted on faith.
     let key = crate::zk_judge::receipt_cache_key(&job.descriptor);
     if let Some(rd) = &zk.receipt_dir {
-        if let Some(d) = crate::zk_judge::verify_cached(zk, rd, &key, &expected_binding) {
+        if let Some(d) = crate::zk_judge::verify_cached(zk, rd, &key, &expected_binding, v2) {
             eprintln!("[net] zk receipt cache hit for {} (key {key})", job.descriptor.job_id);
             let _ = std::fs::remove_dir_all(&dir);
             return Ok(d);
@@ -1173,7 +1195,7 @@ fn prove_one(
             let _ = std::fs::copy(path, rd.join(format!("{}.receipt.bin", job.descriptor.job_id)));
         }
     }
-    crate::zk_judge::judge_decision(&verdict, &expected_binding)
+    crate::zk_judge::judge_decision(&verdict, &expected_binding, v2)
 }
 
 /// Validate and land a remotely submitted job descriptor. The
@@ -1448,7 +1470,7 @@ fn handle_receipt_claim(
             }
         },
     ];
-    match crate::receipt::verify_receipt(&zk.cmd, &receipt_bytes, &expected_binding, &zk.guest_elf)
+    match crate::receipt::verify_receipt(&zk.cmd, &receipt_bytes, &expected_binding, &zk.guest_elf, false)
     {
         Ok(outcome) if outcome.status == 0 => {
             let hash = outcome.chunk_hashes.last().cloned().unwrap_or_default();
