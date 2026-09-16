@@ -109,8 +109,9 @@ byte-identical to the legacy path's for the same input; the rvcore
 replay judge refuses V2 jobs (they are the zk judge's jurisdiction).
 
 See `docs/DESIGN.md` for the decision log, `docs/QUALIFYING.md` for
-whether your workload fits, and `docs/overview.html` for a visual
-briefing.
+whether your workload fits, `docs/PREPRINT.md` for the measured
+account of the architecture (meta-emulation tax, V2 economics, GPU
+gate), and `docs/overview.html` for a visual briefing.
 
 ## What is verified, and what is not
 
