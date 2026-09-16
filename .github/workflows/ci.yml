@@ -184,6 +184,14 @@ jobs:
           P2PC_ZK_VERIFY: ${{ github.workspace }}/sp1-host/target/release/zk-verify
         run: cargo test -p coordinator --test network zk_proving_queue_end_to_end_with_dedup -- --nocapture
 
+      - name: V2 (SP1-native) job through the proving queue (mock prover)
+        env:
+          SP1_PROVER: mock
+          P2PC_ZK_JUDGE_CMD: ${{ github.workspace }}/sp1-host/target/release/zk-judge
+          P2PC_ZK_JUDGE_GUEST_ELF: ${{ github.workspace }}/elf/sp1-guest-emu
+          P2PC_ZK_VERIFY: ${{ github.workspace }}/sp1-host/target/release/zk-verify
+        run: cargo test -p coordinator --test network zk_proving_queue_v2_native_job -- --nocapture
+
       - name: zk dispute judge over the wire (mock prover)
         # SP1_PROVER=mock runs the full judge state machine — execute,
         # binding check, rvcore cross-check, receipt "proof", verdict,

@@ -9,6 +9,9 @@ sp1-exit.txt
 # the nano job ELF is a sealed zk artifact: the committed receipt is
 # bound to its exact bytes, so it is versioned, not rebuilt
 !jobs/demo-hash-nano/program.elf
+# the V2 demo's SP1-native ELF is committed so CI can exercise the V2
+# path (queue, mock proving) without the SP1 toolchain
+!jobs/demo-v2/program.elf
 sp1-guest/elf/
 elf/*
 !elf/sp1-guest-emu

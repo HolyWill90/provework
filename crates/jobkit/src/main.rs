@@ -71,6 +71,10 @@ enum Cmd {
         /// receipt is for MY job", not merely "a valid receipt".
         #[arg(long)]
         desc: Option<PathBuf>,
+        /// The receipt is over a V2 (SP1-native) job: the committed
+        /// binding is the input id only.
+        #[arg(long)]
+        v2: bool,
     },
 }
 
@@ -91,7 +95,8 @@ fn main() {
             zk_verify,
             guest_elf,
             desc,
-        } => verify(&bundle, &zk_verify, &guest_elf, desc.as_deref()),
+            v2,
+        } => verify(&bundle, &zk_verify, &guest_elf, desc.as_deref(), v2),
     }
 }
 
@@ -363,7 +368,7 @@ fn evidence(results: &Path, job_id: &str, out: &Path) {
 
 /// Offline receipt verification: the client-side check that closes
 /// the trust loop — the coordinator's word is not needed.
-fn verify(bundle: &Path, zk_verify: &str, guest_elf: &Path, desc: Option<&Path>) {
+fn verify(bundle: &Path, zk_verify: &str, guest_elf: &Path, desc: Option<&Path>, v2: bool) {
     let receipt = bundle.join("receipt.bin");
     if !receipt.exists() {
         eprintln!("no receipt.bin in bundle {} — nothing to verify", bundle.display());
@@ -371,6 +376,9 @@ fn verify(bundle: &Path, zk_verify: &str, guest_elf: &Path, desc: Option<&Path>)
     }
     let mut cmd = std::process::Command::new(zk_verify);
     cmd.arg(guest_elf).arg(&receipt);
+    if v2 {
+        cmd.arg("--v2");
+    }
     if let Some(d) = desc {
         let bytes = std::fs::read(d).unwrap_or_else(|e| panic!("read {}: {e}", d.display()));
         let descriptor: contentstore::JobDescriptor =

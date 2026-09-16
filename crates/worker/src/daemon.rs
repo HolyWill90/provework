@@ -483,6 +483,74 @@ fn session_once(
                 // same journal format: 8-byte LE instruction count ||
                 // output bytes — the consensus digest binds the cycle
                 // count as well.
+                // V2 jobs are SP1-native guests: the job ELF runs
+                // DIRECTLY on the zkVM (no emulator in the middle —
+                // no ~300x meta-emulation tax). The guest commits
+                // blake3(input) then its output; the journal binds
+                // the output only (jobfmt::V2_JOURNAL_COUNT).
+                #[cfg(feature = "sp1")]
+                if job.manifest.is_sp1_v2() {
+                    let mut stdin = SP1Stdin::new();
+                    stdin.write(&job.input);
+                    let (mut pv, report) = sp1_prover()
+                        .execute(Elf::Dynamic(job.elf.clone().into()), stdin)
+                        .run()
+                        .map_err(|e| format!("sp1 execute: {e}"))?;
+                    let input_id: [u8; 32] = pv.read();
+                    let expected_id: [u8; 32] = blake3::hash(&job.input).into();
+                    if input_id != expected_id {
+                        return Err("sp1 execute: guest input binding mismatch".into());
+                    }
+                    let output: Vec<u8> = pv.read();
+                    let cycles = report.total_instruction_count();
+                    eprintln!(
+                        "[{}] v2 native execute: {} vm cycles, {} output bytes",
+                        cfg.worker_id,
+                        cycles,
+                        output.len()
+                    );
+                    let result = jobfmt::WorkerResult {
+                        worker_id: cfg.worker_id.clone(),
+                        job_id: job.manifest.id,
+                        status: "halted".to_string(),
+                        instructions: cycles,
+                        result_hash: hex(&sha2::Sha256::digest(jobfmt::journal(
+                            jobfmt::V2_JOURNAL_COUNT,
+                            &output,
+                        ))),
+                        chunk_hashes: vec![hex(&sha2::Sha256::digest(jobfmt::journal(
+                            jobfmt::V2_JOURNAL_COUNT,
+                            &output,
+                        )))],
+                        output_hex: Some(hex(&output)),
+                        trap: None,
+                        pubkey_hex: None,
+                        sig_hex: None,
+                    };
+                    // Sign + submit exactly like the shared path below.
+                    let mut result = result;
+                    if let Some(key) = &signing_key {
+                        let msg = jobfmt::signing_message(&result);
+                        let sig = key.sign(&msg);
+                        result.pubkey_hex = Some(hex(&key.verifying_key().to_bytes()));
+                        result.sig_hex = Some(hex(&sig.to_bytes()));
+                    }
+                    counters.jobs.fetch_add(1, Ordering::SeqCst);
+                    println!(
+                        "[{}] submitting v2 result: {} after {} vm cycles",
+                        cfg.worker_id,
+                        &result.result_hash[..16.min(result.result_hash.len())],
+                        result.instructions
+                    );
+                    if let Err(e) =
+                        wire::send(&mut stream, &ClientToServer::JobResult { result })
+                    {
+                        eprintln!("[{}] v2 result submit failed: {e}", cfg.worker_id);
+                        return Ok((SessionEnd::ConnectionLost, stats_snapshot(counters)));
+                    }
+                    submitted = true;
+                    continue;
+                }
                 #[cfg(feature = "sp1")]
                 let (journal, cycle_count, status, trap) = {
                     const EMU_ELF: &[u8] = include_bytes!(concat!(
@@ -535,6 +603,12 @@ fn session_once(
                         (status == "trap").then(|| format!("guest exit status {status_code}")),
                     )
                 };
+                #[cfg(not(feature = "sp1"))]
+                if job.manifest.is_sp1_v2() {
+                    let msg = "v2 (sp1-native) jobs require the sp1 feature (Linux) — rvcore cannot execute them";
+                    eprintln!("[{}] {msg}", cfg.worker_id);
+                    return Err(msg.into());
+                }
                 #[cfg(not(feature = "sp1"))]
                 let (journal, cycle_count, status, trap) = {
                     let image = rvcore::elf::parse(&job.elf).map_err(|e| format!("elf: {e}"))?;

@@ -90,6 +90,7 @@ pub fn verify_receipt(
     receipt_bytes: &[u8],
     expected_binding: &[[u8; 32]; 3],
     guest_elf: &Path,
+    v2: bool,
 ) -> Result<ReceiptOutcome, String> {
     if receipt_bytes.len() > MAX_RECEIPT_BYTES {
         return Err(format!(
@@ -105,6 +106,7 @@ pub fn verify_receipt(
     let mut child = match Command::new(cmd)
         .arg(guest_elf)
         .arg(&receipt_path)
+        .args(v2.then_some("--v2"))
         .args(&binding_hex)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -187,7 +189,7 @@ mod tests {
     fn oversized_receipt_rejected_before_spawn() {
         let big = vec![0u8; MAX_RECEIPT_BYTES + 1];
         let binding = [[0u8; 32]; 3];
-        let err = verify_receipt("definitely-not-a-real-binary", &big, &binding, Path::new("g"))
+        let err = verify_receipt("definitely-not-a-real-binary", &big, &binding, Path::new("g"), false)
             .unwrap_err();
         assert!(err.contains("exceeds"), "got: {err}");
     }
@@ -200,6 +202,7 @@ mod tests {
             &[1, 2, 3],
             &binding,
             Path::new("guest"),
+            false,
         )
         .unwrap_err();
         assert!(err.contains("spawn"), "got: {err}");

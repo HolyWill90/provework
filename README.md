@@ -86,15 +86,18 @@ One journal, three selectable verification tiers:
 | Standard | Optimistic acceptance + replay judgment | Same, at 1× unless challenged | ~1× | implemented |
 | Strong | SP1 zkVM receipt **over the emulator itself executing your actual job** | Everything: no trust in any worker | prover tax | receipt verified and accepted by the network (nano envelope) |
 
-**Execution engine (two paths, one semantics).** Production workers
-execute jobs inside SP1's zkVM: the guest program *is* the pinned
-emulator (`elf/sp1-guest-emu`, embedded at build time), so the job ELF
-keeps its sandbox ABI and every worker runs the same instruction
-semantics inside SP1's deterministic VM — with the guest committing a
-BLAKE3 binding of `(manifest, elf, input)` before executing, so a
-mismatched guest or job cannot be silently accepted. Windows dev builds
-run the same emulator natively (`crates/rvcore`); the semantics, journal
-format, and digests are identical across both paths.
+**Execution engine.** Jobs come in two formats. Legacy (`rv-abi`)
+jobs run inside SP1's zkVM through the pinned-emulator guest
+(`elf/sp1-guest-emu`, embedded at build time): the job ELF keeps its
+sandbox ABI, the guest commits a BLAKE3 binding of
+`(manifest, elf, input)` before executing, and Windows dev builds run
+the same emulator natively. **V2 (`format: "sp1-v2"`) jobs are
+SP1-native guests** — compiled against `io::read`/`commit`, executed
+directly by the zkVM with no emulator in the loop: the measured cost
+of the same 32 KiB job drops from 168.9M to 1.79M VM cycles (~94x),
+turning an unprovable job into an 80-second CPU proof. V2 output is
+byte-identical to the legacy path's for the same input; the rvcore
+replay judge refuses V2 jobs (they are the zk judge's jurisdiction).
 
 See `docs/DESIGN.md` for the decision log, `docs/QUALIFYING.md` for
 whether your workload fits, and `docs/overview.html` for a visual

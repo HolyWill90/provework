@@ -1,9 +1,14 @@
 //! Standalone zk receipt verifier (no prover): invoked by the
 //! coordinator as an external oracle, or by a CLIENT verifying a
 //! receipt offline (jobkit evidence verify). Protocol:
-//!   argv: <guest-elf> <receipt-file> [<binding-hex-1> <2> <3>]
-//!     with the binding ids: the receipt must attest THAT exact
-//!     (manifest, elf, input) triple;
+//!   argv: <guest-elf> <receipt-file> [--v2] [<binding-hex-1> <2> <3>]
+//!     --v2: the receipt is over a V2 (SP1-native) job — public values
+//!       are [input_id, output]; the binding check (when the ids are
+//!       given) compares the input id only, since the elf is bound by
+//!       the verifying key and the manifest is not executed.
+//!     legacy: public values are [binding(3x32), status, instructions,
+//!       chain, output]; all three binding ids are checked.
+//!     with the binding ids: the receipt must attest THAT exact job;
 //!     without them: pure proof verification — the committed values
 //!     are reported, but are not pinned to a specific job.
 //!   stdout: one JSON verdict:
@@ -17,15 +22,21 @@ use sp1_sdk::{ProvingKey, SP1ProofWithPublicValues};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (guest_elf, receipt_file, binding) = match args.as_slice() {
-        [g, r, b1, b2, b3] => (g, r, Some([b1.clone(), b2.clone(), b3.clone()])),
-        [g, r] => (g, r, None),
+    let v2 = args.iter().any(|a| a == "--v2");
+    let rest: Vec<&String> = args.iter().filter(|a| *a != "--v2").collect();
+    let binding = match rest.as_slice() {
+        [g, r, b1, b2, b3] => Some([b1.to_string(), b2.to_string(), b3.to_string()]),
+        [g, r] => None,
         _ => {
-            println!("{{\"ok\":false,\"error\":\"usage: zk-verify <guest-elf> <receipt-file> [<binding-hex-1> <2> <3>]\"}}");
+            println!("{{\"ok\":false,\"error\":\"usage: zk-verify <guest-elf> <receipt-file> [--v2] [<binding-hex-1> <2> <3>]\"}}");
             std::process::exit(1);
         }
     };
-    match run(&guest_elf, &receipt_file, binding.as_ref()) {
+    let (guest_elf, receipt_file) = match rest.as_slice() {
+        [g, r, ..] => (g.to_string(), r.to_string()),
+        _ => unreachable!(),
+    };
+    match run(&guest_elf, &receipt_file, binding.as_ref(), v2) {
         Ok(v) => println!("{v}"),
         Err(e) => {
             println!("{{\"ok\":false,\"error\":{}}}", serde_json::to_string(&e).unwrap());
@@ -38,6 +49,7 @@ fn run(
     guest_elf: &str,
     receipt_file: &str,
     binding_hex: Option<&[String; 3]>,
+    v2: bool,
 ) -> Result<String, String> {
     let expected_binding = match binding_hex {
         Some(ids) => {
@@ -62,16 +74,37 @@ fn run(
         .setup(Elf::Dynamic(guest_bytes.into()))
         .map_err(|e| format!("guest setup: {e}"))?;
 
-    let binding: [[u8; 32]; 3] = proof.public_values.read();
-    if let Some(expected) = &expected_binding {
-        if binding != *expected {
-            return Err("receipt is not for this job's (manifest, elf, input)".into());
+    let (status, instructions, output, chain) = if v2 {
+        let input_id: [u8; 32] = proof.public_values.read();
+        if let Some(expected) = &expected_binding {
+            // expected[2] is the input content id (decoded above).
+            if input_id != expected[2] {
+                return Err("receipt is not for this job's input (binding mismatch)".into());
+            }
         }
-    }
-    let status: u32 = proof.public_values.read();
-    let instructions: u64 = proof.public_values.read();
-    let chain: Vec<[u8; 32]> = proof.public_values.read();
-    let output: Vec<u8> = proof.public_values.read();
+        // V2 journal basis: output only (jobfmt::V2_JOURNAL_COUNT).
+        (
+            0u32,
+            jobfmt::V2_JOURNAL_COUNT,
+            {
+                let output: Vec<u8> = proof.public_values.read();
+                output
+            },
+            Vec::<[u8; 32]>::new(),
+        )
+    } else {
+        let binding: [[u8; 32]; 3] = proof.public_values.read();
+        if let Some(expected) = &expected_binding {
+            if binding != *expected {
+                return Err("receipt is not for this job's (manifest, elf, input)".into());
+            }
+        }
+        let status: u32 = proof.public_values.read();
+        let instructions: u64 = proof.public_values.read();
+        let chain: Vec<[u8; 32]> = proof.public_values.read();
+        let output: Vec<u8> = proof.public_values.read();
+        (status, instructions, output, chain)
+    };
 
     prover
         .verify(&proof, &pk.verifying_key(), None)

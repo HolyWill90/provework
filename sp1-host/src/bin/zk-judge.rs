@@ -1,19 +1,32 @@
-//! Standalone zk dispute judge: re-executes a disputed job inside the
-//! zkVM and produces a cryptographic receipt instead of a bare replay.
-//! Invoked by the coordinator as an external process (the SDK does not
-//! build everywhere, and proving needs a memory envelope the
-//! coordinator itself must not carry). Protocol:
+//! Standalone zk dispute judge / prover: re-executes a job inside the
+//! zkVM and produces a cryptographic receipt. Invoked by the
+//! coordinator as an external process (the SDK does not build
+//! everywhere, and proving needs a memory envelope the coordinator
+//! itself must not carry). Handles BOTH job formats:
+//!
+//! - legacy (rv-abi): the emulator-as-guest executes the job's
+//!   bare-metal ELF; the guest commits (manifest, elf, input) binding,
+//!   status, instruction count, chunk chain, output; the judge
+//!   cross-checks the zkVM execution against its locally linked
+//!   rvcore.
+//! - V2 (sp1-v2): the job ELF is itself an SP1-native guest; it
+//!   commits blake3(input) then the output. There is no second
+//!   implementation to cross-check — the receipt is the check — and
+//!   the journal digest binds the output only (SP1 cycles are a
+//!   compiler artifact, not job semantics).
+//!
+//! Protocol:
 //!   argv: <job-dir> <max-vm-cycles> <guest-elf> [receipt-out]
 //!     job-dir: materialized job (job.json, program.elf, input.bin)
 //!     max-vm-cycles: fail fast BEFORE proving when the execution's VM
-//!       cycle count exceeds this — an emulator-in-a-zkVM multiplies
-//!       job instructions ~300x, so the bound is what keeps a hostile
-//!       or oversized job from burning unprovable compute.
+//!       cycle count exceeds this.
 //!   stdout: one JSON verdict:
 //!     {"ok":true,"status":0,"instructions":N,"output_hex":"..",
-//!      "vm_cycles":N,"proving_secs":S,"binding":["h1","h2","h3"],
-//!      "receipt_saved":"path"|null}
-//!     {"ok":false,"error":"...","vm_cycles":N|null}
+//!      "vm_cycles":N,"proving_secs":S,"binding":["h1",..],
+//!      "v2":bool,"receipt_saved":"path"|null}
+//!     {"ok":false,"error":"..."}
+//!   binding is the committed job binding: 3 ids for legacy,
+//!   [input_id] alone for V2.
 //! SP1_PROVER=mock switches the prover to SP1's mock (fast, no real
 //! cryptography) — used by CI to exercise the full judge state machine
 //! without a proving-sized memory envelope.
@@ -53,6 +66,7 @@ struct Job {
     input: Vec<u8>,
     chunk_size: u64,
     max_instructions: u64,
+    v2: bool,
 }
 
 fn load_job(dir: &str) -> Result<Job, String> {
@@ -64,11 +78,18 @@ fn load_job(dir: &str) -> Result<Job, String> {
         .map_err(|e| format!("job elf: {e}"))?;
     let input = std::fs::read(format!("{dir}/{}", manifest.input))
         .map_err(|e| format!("job input: {e}"))?;
-    Ok(Job { manifest_bytes, elf, input, chunk_size: manifest.chunk_size, max_instructions: manifest.max_instructions })
+    Ok(Job {
+        manifest_bytes,
+        elf,
+        input,
+        chunk_size: manifest.chunk_size,
+        max_instructions: manifest.max_instructions,
+        v2: manifest.is_sp1_v2(),
+    })
 }
 
-/// Read back the guest's committed sequence — the same types in the
-/// same order the emu guest commits them. The reads ADVANCE the
+/// Read back the legacy guest's committed sequence — the same types in
+/// the same order the emu guest commits them. The reads ADVANCE the
 /// buffer cursor, so this is the one and only pass over the values.
 fn read_committed(
     pv: &mut sp1_sdk::SP1PublicValues,
@@ -89,25 +110,28 @@ async fn run(
 ) -> Result<String, String> {
     let max_cycles: u64 = max_cycles.parse().map_err(|_| "max-vm-cycles parse")?;
     let job = load_job(job_dir)?;
-    let guest_bytes =
-        std::fs::read(guest_elf_path).map_err(|e| format!("guest ELF: {e}"))?;
 
-    let binding: [[u8; 32]; 3] = [
-        blake3::hash(&job.manifest_bytes).into(),
-        blake3::hash(&job.elf).into(),
-        blake3::hash(&job.input).into(),
-    ];
-    let binding_hex: Vec<String> = binding.iter().map(|h| hex(h)).collect();
+    // The ELF that actually executes inside the zkVM: the emu guest
+    // for legacy jobs, the job itself for V2.
+    let exec_elf_bytes: Vec<u8> = if job.v2 {
+        job.elf.clone()
+    } else {
+        std::fs::read(guest_elf_path).map_err(|e| format!("guest ELF: {e}"))?
+    };
 
     let prover = ProverClient::from_env().await;
-    let elf = Elf::Dynamic(guest_bytes.into());
+    let elf = Elf::Dynamic(exec_elf_bytes.into());
 
     // 1. Cheap pass: execute only. This yields the VM cycle count the
     //    proving decision needs, plus the committed result.
     let mut stdin = SP1Stdin::new();
-    stdin.write(&job.manifest_bytes);
-    stdin.write(&job.elf);
-    stdin.write(&job.input);
+    if job.v2 {
+        stdin.write(&job.input);
+    } else {
+        stdin.write(&job.manifest_bytes);
+        stdin.write(&job.elf);
+        stdin.write(&job.input);
+    }
     let (mut pv, report) = prover
         .execute(elf.clone(), stdin)
         .await
@@ -118,51 +142,77 @@ async fn run(
             "vm cycle bound exceeded: {vm_cycles} > {max_cycles} — refusing to prove an unbounded trace"
         ));
     }
-    let (committed_binding, status, instructions, _chain, output) = read_committed(&mut pv);
-    if committed_binding != binding {
-        return Err("guest binding does not match this job's (manifest, elf, input)".into());
-    }
 
-    // 2. Independent cross-check against the locally linked rvcore: the
-    //    guest embeds rvcore at ITS build time, so this catches a guest
-    //    artifact that drifted from the judge's pinned semantics.
-    let image = rvcore::elf::parse(&job.elf).map_err(|e| format!("elf parse: {e}"))?;
-    let mut mem = rvcore::Mem::new();
-    rvcore::elf::load(&mut mem, &image).map_err(|e| format!("elf load: {e}"))?;
-    let outcome = rvcore::interp::run(
-        &mut mem,
-        image.entry,
-        &job.input,
-        &rvcore::Config {
-            chunk_size: job.chunk_size,
-            max_instructions: job.max_instructions,
-            ..Default::default()
-        },
-    );
-    let rv_status = match &outcome.status {
-        rvcore::interp::ExitStatus::Halted | rvcore::interp::ExitStatus::Tohost(_) => 0,
-        rvcore::interp::ExitStatus::InstructionLimit => 1,
-        rvcore::interp::ExitStatus::Trapped(_) => 2,
+    // 2. Committed values + binding, per format.
+    let (status, instructions, output, binding_hex) = if job.v2 {
+        let input_id: [u8; 32] = pv.read();
+        let output: Vec<u8> = pv.read();
+        let expected: [u8; 32] = blake3::hash(&job.input).into();
+        if input_id != expected {
+            return Err("v2 guest input binding mismatch".into());
+        }
+        (0u32, jobfmt::V2_JOURNAL_COUNT, output, vec![hex(&expected)])
+    } else {
+        let binding: [[u8; 32]; 3] = [
+            blake3::hash(&job.manifest_bytes).into(),
+            blake3::hash(&job.elf).into(),
+            blake3::hash(&job.input).into(),
+        ];
+        let (committed, status, instructions, _chain, output) = read_committed(&mut pv);
+        if committed != binding {
+            return Err("guest binding does not match this job's (manifest, elf, input)".into());
+        }
+        (status, instructions, output, binding.iter().map(|h| hex(h)).collect())
     };
-    let rv_output = outcome.output.unwrap_or_default();
-    if rv_status != status || outcome.instructions != instructions || rv_output != output {
-        return Err(format!(
-            "guest and local rvcore disagree (status {status}/{rv_status}, instructions {instructions}/{}, output {} bytes/{} bytes)",
-            outcome.instructions,
-            output.len(),
-            rv_output.len(),
-        ));
+
+    // 3. Legacy only: cross-check against the locally linked rvcore.
+    //    The guest embeds rvcore at ITS build time, so this catches a
+    //    guest artifact that drifted from the pinned semantics. V2
+    //    jobs have no second implementation — the receipt is the check.
+    if !job.v2 {
+        let image = rvcore::elf::parse(&job.elf).map_err(|e| format!("elf parse: {e}"))?;
+        let mut mem = rvcore::Mem::new();
+        rvcore::elf::load(&mut mem, &image).map_err(|e| format!("elf load: {e}"))?;
+        let outcome = rvcore::interp::run(
+            &mut mem,
+            image.entry,
+            &job.input,
+            &rvcore::Config {
+                chunk_size: job.chunk_size,
+                max_instructions: job.max_instructions,
+                ..Default::default()
+            },
+        );
+        let rv_status = match &outcome.status {
+            rvcore::interp::ExitStatus::Halted | rvcore::interp::ExitStatus::Tohost(_) => 0,
+            rvcore::interp::ExitStatus::InstructionLimit => 1,
+            rvcore::interp::ExitStatus::Trapped(_) => 2,
+        };
+        let rv_output = outcome.output.unwrap_or_default();
+        if rv_status != status || outcome.instructions != instructions || rv_output != output {
+            return Err(format!(
+                "guest and local rvcore disagree (status {status}/{rv_status}, instructions {instructions}/{}, output {} bytes/{} bytes)",
+                outcome.instructions,
+                output.len(),
+                rv_output.len(),
+            ));
+        }
     }
 
-    // 3. The proof. Fail-fast above already bounded the trace.
+    // 4. The proof, over the same ELF that executed. Fail-fast above
+    //    already bounded the trace.
     let pk = prover
         .setup(elf.clone())
         .await
         .map_err(|e| format!("setup: {e}"))?;
     let mut stdin = SP1Stdin::new();
-    stdin.write(&job.manifest_bytes);
-    stdin.write(&job.elf);
-    stdin.write(&job.input);
+    if job.v2 {
+        stdin.write(&job.input);
+    } else {
+        stdin.write(&job.manifest_bytes);
+        stdin.write(&job.elf);
+        stdin.write(&job.input);
+    }
     let t0 = std::time::Instant::now();
     let mut proof = prover
         .prove(&pk, stdin)
@@ -174,8 +224,16 @@ async fn run(
     prover
         .verify(&proof, &pk.verifying_key(), None)
         .map_err(|e| format!("receipt verification: {e}"))?;
-    let (_, p_status, p_instructions, _, p_output) = read_committed(&mut proof.public_values);
-    if (p_status, p_instructions, p_output) != (status, instructions, output.clone()) {
+    let p_match = if job.v2 {
+        let p_input: [u8; 32] = proof.public_values.read();
+        let p_output: Vec<u8> = proof.public_values.read();
+        let want: [u8; 32] = blake3::hash(&job.input).into();
+        p_input == want && p_output == output
+    } else {
+        let (_, p_status, p_instructions, _, p_output) = read_committed(&mut proof.public_values);
+        p_status == status && p_instructions == instructions && p_output == output
+    };
+    if !p_match {
         return Err("proved public values differ from the executed ones".into());
     }
 
@@ -186,9 +244,10 @@ async fn run(
     }
 
     Ok(format!(
-        "{{\"ok\":true,\"status\":{status},\"instructions\":{instructions},\"output_hex\":{},\"vm_cycles\":{vm_cycles},\"proving_secs\":{proving_secs:.1},\"binding\":{},\"receipt_saved\":{}}}",
+        "{{\"ok\":true,\"status\":{status},\"instructions\":{instructions},\"output_hex\":{},\"vm_cycles\":{vm_cycles},\"proving_secs\":{proving_secs:.1},\"binding\":{},\"v2\":{},\"receipt_saved\":{}}}",
         serde_json::to_string(&hex(&output)).unwrap(),
         serde_json::to_string(&binding_hex).unwrap(),
+        job.v2,
         serde_json::to_string(&receipt_saved).unwrap(),
     ))
 }

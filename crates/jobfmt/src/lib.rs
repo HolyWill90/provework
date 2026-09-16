@@ -12,6 +12,13 @@ pub struct JobManifest {
     pub name: String,
     /// Pinned ISA string; must equal abi::ISA.
     pub isa: String,
+    /// Job format. None (or "rv-abi") = the legacy bare-metal ABI
+    /// executed by rvcore (or by the emulator-in-zkVM guest).
+    /// "sp1-v2" = an SP1-native guest: reads its input via
+    /// `sp1_zkvm::io::read`, commits blake3(input) then the output —
+    /// executable ONLY by SP1 (no rvcore replay is possible).
+    #[serde(default)]
+    pub format: Option<String>,
     /// Toolchain description for humans; the emulator contract is the
     /// ISA, this field documents what built the ELF.
     pub toolchain: String,
@@ -142,6 +149,19 @@ pub fn journal_digest(instructions: u64, output: &[u8]) -> [u8; 32] {
     use sha2::Digest;
     sha2::Sha256::digest(journal(instructions, output)).into()
 }
+
+impl JobManifest {
+    /// V2 jobs are SP1-native guests (see [`JobManifest::format`]).
+    pub fn is_sp1_v2(&self) -> bool {
+        self.format.as_deref() == Some("sp1-v2")
+    }
+}
+
+/// The V2 journal basis: SP1 cycle counts are a compiler/SDK-version
+/// artifact, not architectural state, so the digest binds the output
+/// only (count field zeroed). Cross-worker agreement comes from the
+/// output being deterministic; receipts stay version-stable.
+pub const V2_JOURNAL_COUNT: u64 = 0;
 
 /// The exact bytes a worker signs and a coordinator verifies: a
 /// length-prefixed encoding of every result field except the key and

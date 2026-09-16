@@ -177,6 +177,7 @@ pub fn run_judge(
 pub fn judge_decision(
     verdict: &JudgeVerdict,
     expected_binding: &[[u8; 32]; 3],
+    v2: bool,
 ) -> Result<Decision, String> {
     if !verdict.ok {
         return Err(verdict
@@ -185,13 +186,26 @@ pub fn judge_decision(
             .unwrap_or_else(|| "judge rejected".into()));
     }
     let binding_hex = verdict.binding.as_ref().ok_or("verdict missing binding")?;
-    if binding_hex.len() != 3 {
-        return Err("verdict binding malformed".into());
-    }
-    for (hex_id, expected) in binding_hex.iter().zip(expected_binding) {
-        let bytes = jobfmt::from_hex(hex_id, 32).map_err(|e| format!("binding hex: {e}"))?;
-        if bytes.as_slice() != expected {
-            return Err("judge verdict is not for this job's (manifest, elf, input)".into());
+    if v2 {
+        // V2 receipts commit the input id only; the elf is bound by
+        // the verifying key and the manifest is not executed.
+        if binding_hex.len() != 1 {
+            return Err("v2 verdict binding malformed".into());
+        }
+        let bytes = jobfmt::from_hex(&binding_hex[0], 32)
+            .map_err(|e| format!("binding hex: {e}"))?;
+        if bytes.as_slice() != &expected_binding[2] {
+            return Err("judge verdict is not for this job's input".into());
+        }
+    } else {
+        if binding_hex.len() != 3 {
+            return Err("verdict binding malformed".into());
+        }
+        for (hex_id, expected) in binding_hex.iter().zip(expected_binding) {
+            let bytes = jobfmt::from_hex(hex_id, 32).map_err(|e| format!("binding hex: {e}"))?;
+            if bytes.as_slice() != expected {
+                return Err("judge verdict is not for this job's (manifest, elf, input)".into());
+            }
         }
     }
     let status = verdict.status.ok_or("verdict missing status")?;
@@ -240,18 +254,25 @@ pub fn verify_cached(
     receipt_dir: &Path,
     key: &str,
     expected_binding: &[[u8; 32]; 3],
+    v2: bool,
 ) -> Option<Decision> {
     let Some(verify_cmd) = &zk.verify_cmd else { return None };
     let (receipt_path, _) = cache_paths(receipt_dir, key);
     let receipt_bytes = std::fs::read(&receipt_path).ok()?;
-    let outcome =
-        crate::receipt::verify_receipt(verify_cmd, &receipt_bytes, expected_binding, &zk.guest_elf)
-            .ok()?;
+    let outcome = crate::receipt::verify_receipt(
+        verify_cmd,
+        &receipt_bytes,
+        expected_binding,
+        &zk.guest_elf,
+        v2,
+    )
+    .ok()?;
     if outcome.status != 0 {
         return None;
     }
     let output = jobfmt::from_hex(&outcome.output_hex, outcome.output_hex.len() / 2).ok()?;
-    let hash = hex(&jobfmt::journal_digest(outcome.instructions, &output));
+    let count = if v2 { jobfmt::V2_JOURNAL_COUNT } else { outcome.instructions };
+    let hash = hex(&jobfmt::journal_digest(count, &output));
     Some(Decision::Accept {
         hash,
         output_hex: Some(outcome.output_hex),
@@ -291,7 +312,7 @@ mod tests {
         // instructions=5, output=01: journal = 05..00 || 01, digest
         // must equal SHA-256 of that — recompute independently here.
         let v = verdict(true, 0, 5, "01");
-        let d = judge_decision(&v, &binding()).unwrap();
+        let d = judge_decision(&v, &binding(), false).unwrap();
         let Decision::Accept { hash, zk, agreed, output_hex } = d else {
             panic!("expected accept");
         };
@@ -315,21 +336,21 @@ mod tests {
         let v = verdict(true, 0, 5, "01");
         let mut wrong = binding();
         wrong[2][0] = 0xff;
-        let err = judge_decision(&v, &wrong).unwrap_err();
+        let err = judge_decision(&v, &wrong, false).unwrap_err();
         assert!(err.contains("not for this job"), "got: {err}");
     }
 
     #[test]
     fn trapped_job_is_a_reject_not_an_accept() {
         let v = verdict(true, 2, 5, "01");
-        let d = judge_decision(&v, &binding()).unwrap();
+        let d = judge_decision(&v, &binding(), false).unwrap();
         assert!(matches!(d, Decision::Reject { .. }));
     }
 
     #[test]
     fn failing_verdict_is_an_error() {
         let v: JudgeVerdict = serde_json::from_str("{\"ok\":false,\"error\":\"boom\"}").unwrap();
-        let err = judge_decision(&v, &binding()).unwrap_err();
+        let err = judge_decision(&v, &binding(), false).unwrap_err();
         assert!(err.contains("boom"));
     }
 }
