@@ -7,11 +7,24 @@
 //! on the wire, optionally serving blobs to peers.
 
 use ed25519_dalek::{Signer, SigningKey};
+use sha2::Digest;
+#[cfg(feature = "sp1")]
+use sp1_sdk::blocking::{Elf, Prover as _, ProverClient, SP1Stdin};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use wire::{ClientToServer, PeerToPeer, ServerToClient};
+
+/// SP1's CPU prover is expensive to construct (it spins up its whole
+/// worker machinery), so one instance is shared by every session and
+/// job in the process.
+#[cfg(feature = "sp1")]
+fn sp1_prover() -> &'static sp1_sdk::blocking::CpuProver {
+    static PROVER: std::sync::OnceLock<sp1_sdk::blocking::CpuProver> =
+        std::sync::OnceLock::new();
+    PROVER.get_or_init(|| ProverClient::builder().cpu().build())
+}
 
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -26,8 +39,9 @@ pub struct DaemonConfig {
     pub listen_port: Option<u16>,
     /// Test hook: corrupt the result like a lying worker would.
     pub corrupt: bool,
-    /// With `corrupt`: the hex digit the last hash character becomes,
-    /// so two lying workers can fabricate DIFFERENT wrong results.
+    /// With `corrupt`: the journal byte index to bump (defaults to the
+    /// last byte). Any ±1 bump guarantees divergence from the honest
+    /// digest — there is no coincidental-match window.
     pub corrupt_byte: Option<u8>,
     /// Test hook: submit the result this many EXTRA times, emulating a
     /// worker trying to stuff the quorum with duplicate votes.
@@ -85,12 +99,6 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn set_last(s: &mut str, c: char) {
-    let bytes = unsafe { s.as_bytes_mut() };
-    let n = bytes.len();
-    bytes[n - 1] = c as u8;
 }
 
 /// Serve blobs to peers until the process ends. Every blob handed out
@@ -466,77 +474,133 @@ fn session_once(
                 eprintln!("[{}] materialized job into {}", cfg.worker_id, job_dir.display());
                 let job = jobfmt::load_dir(&job_dir).map_err(|e| format!("load: {e}"))?;
 
-                // Execute in the pinned deterministic emulator.
-                let image = rvcore::elf::parse(&job.elf).map_err(|e| format!("elf: {e}"))?;
-                let mut mem = rvcore::Mem::new();
-                rvcore::elf::load(&mut mem, &image).map_err(|e| format!("elf: {e}"))?;
+                // Execute the job. SP1 path (Linux/production): the
+                // guest IS the pinned emulator — the job ELF keeps its
+                // rvcore ABI (memory-mapped I/O, ebreak halt) which
+                // SP1 does not honor directly, so SP1 executes rvcore
+                // on the job inside the zkVM. Fallback path (Windows
+                // dev): the same rvcore runs natively. Both yield the
+                // same journal format: 8-byte LE instruction count ||
+                // output bytes — the consensus digest binds the cycle
+                // count as well.
+                #[cfg(feature = "sp1")]
+                let (journal, cycle_count, status, trap) = {
+                    const EMU_ELF: &[u8] = include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../elf/sp1-guest-emu"
+                    ));
+                    let manifest_bytes = std::fs::read(job_dir.join("job.json"))
+                        .map_err(|e| format!("manifest: {e}"))?;
+                    let mut stdin = SP1Stdin::new();
+                    stdin.write(&manifest_bytes);
+                    stdin.write(&job.elf);
+                    stdin.write(&job.input);
+                    let (mut pv, report) = sp1_prover()
+                        .execute(Elf::Dynamic(EMU_ELF.into()), stdin)
+                        .run()
+                        .map_err(|e| format!("sp1 execute: {e}"))?;
+                    // Read back the guest's committed sequence (same
+                    // types, same order the guest committed them).
+                    let binding: [[u8; 32]; 3] = pv.read();
+                    let expected: [[u8; 32]; 3] = [
+                        blake3::hash(&manifest_bytes).into(),
+                        blake3::hash(&job.elf).into(),
+                        blake3::hash(&job.input).into(),
+                    ];
+                    if binding != expected {
+                        return Err("sp1 execute: guest binding does not match this job".into());
+                    }
+                    let status_code: u32 = pv.read();
+                    let instructions: u64 = pv.read();
+                    let _chain: Vec<[u8; 32]> = pv.read();
+                    let output: Vec<u8> = pv.read();
+                    let status = match status_code {
+                        0 => "halted",
+                        1 => "instruction_limit",
+                        _ => "trap",
+                    };
+                    // SP1's VM cycle count is executor overhead, not
+                    // job length; the guest's committed rvcore count
+                    // is the honest instruction count.
+                    eprintln!(
+                        "[{}] sp1 execute: {} job instructions, {} vm cycles",
+                        cfg.worker_id,
+                        instructions,
+                        report.total_instruction_count()
+                    );
+                    (
+                        jobfmt::journal(instructions, &output),
+                        instructions,
+                        status.to_string(),
+                        (status == "trap").then(|| format!("guest exit status {status_code}")),
+                    )
+                };
+                #[cfg(not(feature = "sp1"))]
+                let (journal, cycle_count, status, trap) = {
+                    let image = rvcore::elf::parse(&job.elf).map_err(|e| format!("elf: {e}"))?;
+                    let mut mem = rvcore::Mem::new();
+                    rvcore::elf::load(&mut mem, &image).map_err(|e| format!("elf: {e}"))?;
+                    let outcome = rvcore::interp::run(
+                        &mut mem,
+                        image.entry,
+                        &job.input,
+                        &rvcore::Config {
+                            chunk_size: job.manifest.chunk_size,
+                            max_instructions: job.manifest.max_instructions,
+                            ..Default::default()
+                        },
+                    );
+                    let cycles = outcome.instructions;
+                    let output = outcome.output.unwrap_or_default();
+                    let status = match &outcome.status {
+                        rvcore::interp::ExitStatus::Halted
+                        | rvcore::interp::ExitStatus::Tohost(_) => "halted",
+                        rvcore::interp::ExitStatus::InstructionLimit => "instruction_limit",
+                        rvcore::interp::ExitStatus::Trapped(_) => "trap",
+                    };
+                    let trap = match &outcome.status {
+                        rvcore::interp::ExitStatus::Trapped(t) => Some(format!("{t:?}")),
+                        _ => None,
+                    };
+                    (jobfmt::journal(cycles, &output), cycles, status.to_string(), trap)
+                };
                 eprintln!(
-                    "[{}] executing {} ({} bytes input, chunk {})",
-                    cfg.worker_id, job.manifest.name, job.input.len(), job.manifest.chunk_size
-                );
-                let outcome = rvcore::interp::run(
-                    &mut mem,
-                    image.entry,
-                    &job.input,
-                    &rvcore::Config {
-                        chunk_size: job.manifest.chunk_size,
-                        max_instructions: job.manifest.max_instructions,
-                        ..Default::default()
-                    },
-                );
-                eprintln!(
-                    "[{}] executed: {} after {} instructions",
-                    cfg.worker_id,
-                    match &outcome.status {
-                        rvcore::ExitStatus::Halted | rvcore::ExitStatus::Tohost(_) => "halted".to_string(),
-                        rvcore::ExitStatus::InstructionLimit => "limit".to_string(),
-                        rvcore::ExitStatus::Trapped(t) => format!("trap {t:?}"),
-                    },
-                    outcome.instructions
+                    "[{}] executed {} ({} instructions, {} bytes journal)",
+                    cfg.worker_id, job.manifest.name, cycle_count, journal.len()
                 );
 
-                let status = match &outcome.status {
-                    rvcore::ExitStatus::Halted | rvcore::ExitStatus::Tohost(_) => "halted",
-                    rvcore::ExitStatus::InstructionLimit => "instruction_limit",
-                    rvcore::ExitStatus::Trapped(_) => "trap",
-                };
-                let trap = match outcome.status {
-                    rvcore::ExitStatus::Trapped(t) => Some(format!("{t:?}")),
-                    _ => None,
-                };
-                let mut chunk_hashes: Vec<String> =
-                    outcome.chunk_hashes.iter().map(|h| hex(h)).collect();
-                let mut result_hash =
-                    chunk_hashes.last().cloned().unwrap_or_else(|| hex(&rvcore::GENESIS));
-                if cfg.corrupt && !chunk_hashes.is_empty() {
-                    // Guarantee divergence: the replacement digit is the
-                    // honest digit + 1 (mod 16), so the corrupted hash
-                    // always differs from the honest one no matter what
-                    // the honest tail happened to be.
-                    let honest = result_hash.chars().last().unwrap().to_digit(16).unwrap();
-                    let replacement = match cfg.corrupt_byte {
-                        Some(b) => {
-                            let c = char::from_digit((b & 0xF) as u32, 16).unwrap();
-                            if c == result_hash.chars().last().unwrap() {
-                                char::from_digit((c.to_digit(16).unwrap() + 1) % 16, 16).unwrap()
-                            } else {
-                                c
-                            }
-                        }
-                        None => char::from_digit((honest + 1) % 16, 16).unwrap(),
-                    };
-                    set_last(&mut result_hash, replacement);
-                    set_last(chunk_hashes.last_mut().unwrap(), replacement);
+                // Corruption: bump one journal byte (last, or the
+                // --corrupt-byte index) so the commitment diverges from
+                // the honest journal — a ±1 bump can never round-trip.
+                let mut journal_bytes = journal.clone();
+                if cfg.corrupt && !journal_bytes.is_empty() {
+                    let idx = cfg
+                        .corrupt_byte
+                        .map(|i| (i as usize) % journal_bytes.len())
+                        .unwrap_or(journal_bytes.len() - 1);
+                    journal_bytes[idx] = journal_bytes[idx].wrapping_add(1);
                 }
 
+                // Consensus commitment: SHA-256 of the journal. Workers
+                // exchange and vote on this 32-byte digest, not the raw
+                // buffer — saving bandwidth on large outputs.
+                let journal_digest = sha2::Sha256::digest(&journal_bytes);
+                let result_hash = hex(&journal_digest);
+                let chunk_hashes = vec![result_hash.clone()];
+                let output_hex = if journal.len() > 8 {
+                    Some(hex(jobfmt::journal_output(&journal)))
+                } else {
+                    None
+                };
+                let instructions = cycle_count;
                 let mut result = jobfmt::WorkerResult {
                     worker_id: cfg.worker_id.clone(),
                     job_id: job.manifest.id,
-                    status: status.to_string(),
-                    instructions: outcome.instructions,
+                    status,
+                    instructions,
                     result_hash,
                     chunk_hashes,
-                    output_hex: outcome.output.as_ref().map(|o| hex(o)),
+                    output_hex,
                     trap,
                     pubkey_hex: None,
                     sig_hex: None,

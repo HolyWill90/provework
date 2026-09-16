@@ -1,0 +1,11 @@
+[package]
+name = "sp1-guest-scaffold"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+sp1-zkvm = "6.8.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

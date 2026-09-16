@@ -103,6 +103,24 @@ pub fn judge_by_replay(
     Some(rvcore::interp::run(&mut mem, entry, input, &cfg).chunk_hashes)
 }
 
+/// Authoritative re-execution from genesis: returns the instruction
+/// count and output bytes an honest worker would have produced, so
+/// the network judge can construct the identical consensus journal.
+pub fn replay_journal(
+    elf: &[u8],
+    entry: u64,
+    input: &[u8],
+    chunk_size: u64,
+    max_instructions: u64,
+) -> Option<(u64, Vec<u8>)> {
+    let image = rvcore::elf::parse(elf).ok()?;
+    let mut mem = rvcore::Mem::new();
+    rvcore::elf::load(&mut mem, &image).ok()?;
+    let cfg = Config { chunk_size, max_instructions, ..Default::default() };
+    let outcome = rvcore::interp::run(&mut mem, entry, input, &cfg);
+    Some((outcome.instructions, outcome.output.unwrap_or_default()))
+}
+
 /// Fast judge: one chunk executed from a verified snapshot. Returns
 /// `None` when the snapshot path is unavailable (k = 0, missing file)
 /// or the snapshot fails verification — callers fall back to replay.

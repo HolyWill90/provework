@@ -920,7 +920,7 @@ fn judge_by_replay_network(
     let elf = std::fs::read(dir.join(&manifest.elf)).ok()?;
     let input = std::fs::read(dir.join(&manifest.input)).ok()?;
     let image = rvcore::elf::parse(&elf).ok()?;
-    let truth = crate::dispute::judge_by_replay(
+    let (instructions, output) = crate::dispute::replay_journal(
         &elf,
         image.entry,
         &input,
@@ -928,22 +928,21 @@ fn judge_by_replay_network(
         manifest.max_instructions,
     )?;
     let _ = std::fs::remove_dir_all(&dir);
-    let truth_hex: Vec<String> = truth.iter().map(|h| hex(h)).collect();
+    // The consensus commitment is SHA-256 over the journal — the same
+    // construction workers use, so digests are comparable as-is. The
+    // verdict carries the JUDGE's own output, never a liar's claim.
+    let truth_digest = hex(&jobfmt::journal_digest(instructions, &output));
+    let output_hex = Some(hex(&output));
 
     let mut agreed: Vec<String> = Vec::new();
-    let hash = truth.last().map(|h| hex(h)).unwrap_or_default();
-    let mut output_hex = None;
     for r in &job.results {
-        if r.chunk_hashes == truth_hex {
+        if r.chunk_hashes.len() == 1 && r.chunk_hashes[0] == truth_digest {
             if !agreed.contains(&r.worker_id) {
                 agreed.push(r.worker_id.clone());
             }
-            if output_hex.is_none() {
-                output_hex = r.output_hex.clone();
-            }
         }
     }
-    Some(Decision::Accept { hash, output_hex, agreed, zk: false })
+    Some(Decision::Accept { hash: truth_digest, output_hex, agreed, zk: false })
 }
 
 /// Validate and land a remotely submitted job descriptor. The

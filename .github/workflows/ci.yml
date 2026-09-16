@@ -39,6 +39,12 @@ jobs:
       - name: Unit tests (ISA + quorum + network integration)
         run: cargo test --workspace
 
+      - name: SP1 execution path compiles (production tier; Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
+          cargo check -p worker --features sp1
+
       - name: Official riscv-tests tally (tohost)
         run: cargo run -p conformance -- arch arch-tests
 
