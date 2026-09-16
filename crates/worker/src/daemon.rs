@@ -509,9 +509,21 @@ fn session_once(
                 let mut result_hash =
                     chunk_hashes.last().cloned().unwrap_or_else(|| hex(&rvcore::GENESIS));
                 if cfg.corrupt && !chunk_hashes.is_empty() {
+                    // Guarantee divergence: the replacement digit is the
+                    // honest digit + 1 (mod 16), so the corrupted hash
+                    // always differs from the honest one no matter what
+                    // the honest tail happened to be.
+                    let honest = result_hash.chars().last().unwrap().to_digit(16).unwrap();
                     let replacement = match cfg.corrupt_byte {
-                        Some(b) => format!("{:x}", b & 0xF).pop().unwrap(),
-                        None => '1',
+                        Some(b) => {
+                            let c = char::from_digit((b & 0xF) as u32, 16).unwrap();
+                            if c == result_hash.chars().last().unwrap() {
+                                char::from_digit((c.to_digit(16).unwrap() + 1) % 16, 16).unwrap()
+                            } else {
+                                c
+                            }
+                        }
+                        None => char::from_digit((honest + 1) % 16, 16).unwrap(),
                     };
                     set_last(&mut result_hash, replacement);
                     set_last(chunk_hashes.last_mut().unwrap(), replacement);
