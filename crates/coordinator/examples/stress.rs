@@ -41,6 +41,7 @@ fn main() {
         results_dir: None,
         zk: None,
         zk_judge: None,
+        zk_prover: None,
         round1_ids: None,
         pool: Some(2),
         round1_size: None,
