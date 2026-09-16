@@ -217,10 +217,21 @@ jobs:
           cp jobs/agent-task/job/target/riscv64imac-unknown-none-elf/release/agent-task jobs/agent-task/program.elf
           cp jobs/demo-hash/program.elf jobs/demo-hash-smoke/program.elf
           cp jobs/demo-hash/program.elf jobs/demo-hash-nano/program.elf
+      - name: Build the zk binaries (the zk-tier tests count toward
+              coverage under the mock prover)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
+          (cd sp1-host && cargo build --release --bins)
       - name: Coverage floor — workspace
-        # 61% measured with the integration tests running; per-crate
-        # floors would gate on package-isolated runs that lose the
-        # coordinator integration tests' coverage and are meaningless.
+        # Per-crate floors would gate on package-isolated runs that
+        # lose the coordinator integration tests' coverage and are
+        # meaningless. The zk-tier tests run here under the mock
+        # prover so the strong-tier code is counted, not skipped.
+        env:
+          SP1_PROVER: mock
+          P2PC_ZK_JUDGE_CMD: ${{ github.workspace }}/sp1-host/target/release/zk-judge
+          P2PC_ZK_JUDGE_GUEST_ELF: ${{ github.workspace }}/elf/sp1-guest-emu
+          P2PC_ZK_VERIFY: ${{ github.workspace }}/sp1-host/target/release/zk-verify
         run: cargo llvm-cov --workspace --fail-under-lines 55
 
   cross-verify:
