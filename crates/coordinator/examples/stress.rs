@@ -40,6 +40,7 @@ fn main() {
         accept_submissions: false,
         results_dir: None,
         zk: None,
+        zk_judge: None,
         round1_ids: None,
         pool: Some(2),
         round1_size: None,

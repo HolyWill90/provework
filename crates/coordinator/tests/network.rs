@@ -69,6 +69,7 @@ fn multi_job_session_with_p2p_blob_exchange() {
         accept_submissions: false,
         results_dir: None,
         zk: None,
+        zk_judge: None,
         round1_ids: None,
         pool: Some(2),
         round1_size: None,
@@ -243,6 +244,7 @@ fn tls_network_session() {
         accept_submissions: false,
         results_dir: None,
         zk: None,
+        zk_judge: None,
         round1_ids: None,
         pool: Some(2),
         round1_size: None,
@@ -350,6 +352,7 @@ fn reserve_escalation_beats_lying_worker() {
         accept_submissions: false,
         results_dir: None,
         zk: None,
+        zk_judge: None,
         pool: Some(3),
         round1_size: None,
         round1_ids: Some(vec!["wA".into(), "wB".into()]),
@@ -438,6 +441,7 @@ fn partial_descriptor_write_does_not_kill_server() {
         accept_submissions: false,
         results_dir: None,
         zk: None,
+        zk_judge: None,
         pool: Some(1),
         round1_size: None,
         round1_ids: None,
@@ -585,6 +589,7 @@ fn net_security_cfg(
         accept_submissions: false,
         results_dir: None,
         zk: None,
+        zk_judge: None,
         pool: Some(pool),
         round1_size: None,
         round1_ids: Some(round1),
@@ -698,6 +703,7 @@ fn duplicate_submissions_do_not_stuff_quorum() {
         accept_submissions: false,
         results_dir: None,
         zk: None,
+        zk_judge: None,
         pool: Some(2),
         round1_size: None,
         round1_ids: Some(vec!["wA".into(), "wB".into()]),
@@ -804,6 +810,7 @@ fn zk_receipt_claim_accepts_job() {
             cmd: verify_cmd,
             guest_elf: PathBuf::from(guest_elf),
         }),
+        zk_judge: None,
         pool: Some(1),
         round1_size: None,
         round1_ids: None,
@@ -882,6 +889,7 @@ fn dispute_judge_convicts_diverging_fabrications() {
         accept_submissions: false,
         results_dir: None,
         zk: None,
+        zk_judge: None,
         pool: Some(2),
         round1_size: None,
         round1_ids: Some(vec!["wA".into(), "wB".into()]),
@@ -936,6 +944,119 @@ fn dispute_judge_convicts_diverging_fabrications() {
     let ledger = std::fs::read_to_string(root.join("ledger.json")).unwrap();
     assert!(ledger.contains("\"wA\": -100") && ledger.contains("\"wB\": -100"),
         "both liars slashed: {ledger}");
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// zk dispute judge end to end: one honest worker against one liar
+/// (no majority, no reserves) escalates to the external zk-judge
+/// process, whose SP1 receipt re-executes the job inside the zkVM.
+/// Gated on P2PC_ZK_JUDGE_CMD + P2PC_ZK_JUDGE_GUEST_ELF: CI runs it
+/// with SP1_PROVER=mock (fast, no real proving); the Linux proving
+/// container runs it with the real CPU prover.
+#[test]
+fn zk_judge_dispute_receipt_vindicates_honest_worker() {
+    let Ok(judge_cmd) = std::env::var("P2PC_ZK_JUDGE_CMD") else {
+        eprintln!("SKIP: P2PC_ZK_JUDGE_CMD not set (build sp1-host/zk-judge)");
+        return;
+    };
+    let Ok(guest_elf) = std::env::var("P2PC_ZK_JUDGE_GUEST_ELF") else {
+        eprintln!("SKIP: P2PC_ZK_JUDGE_GUEST_ELF not set");
+        return;
+    };
+    if !Path::new(&judge_cmd).exists() || !Path::new(&guest_elf).exists() {
+        eprintln!("SKIP: zk judge binary or guest ELF missing");
+        return;
+    }
+    // The nano job: its program.elf is a committed sealed artifact, so
+    // this test needs no job build step.
+    if !Path::new("../../jobs/demo-hash-nano/program.elf").exists() {
+        eprintln!("SKIP: jobs/demo-hash-nano/program.elf missing");
+        return;
+    }
+    let root = temp_dir("p2pc-net-zkjudge");
+    let jobs_dir = root.join("jobs");
+    let store_dir = root.join("store");
+    std::fs::create_dir_all(&jobs_dir).unwrap();
+    let store = contentstore::Store::open(&store_dir).unwrap();
+    let desc = contentstore::publish(&PathBuf::from("../../jobs/demo-hash-nano"), &store).unwrap();
+
+    let (bound_tx, bound_rx) = channel();
+    let (job_tx, job_rx) = channel::<JobOutcome>();
+    let cfg = net::ServeConfig {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        jobs_dir: jobs_dir.clone(),
+        store_dir: store_dir.clone(),
+        per_job_deadline: std::time::Duration::from_secs(90),
+        ledger: Some(root.join("ledger.json")),
+        require_identity: true,
+        identity_pow_bits: 8,
+        accept_submissions: false,
+        results_dir: None,
+        zk: None,
+        zk_judge: Some(coordinator::zk_judge::ZkJudge {
+            cmd: judge_cmd,
+            guest_elf: PathBuf::from(&guest_elf),
+            // Mock prover: instantaneous. Real prover: the nano
+            // envelope measured 140 s / 24 GB (docs/DESIGN.md) — the
+            // bound and timeout leave headroom for slower hosts.
+            max_vm_cycles: 10_000_000,
+            timeout: std::time::Duration::from_secs(900),
+            receipt_dir: None,
+        }),
+        pool: Some(2),
+        round1_size: None,
+        round1_ids: Some(vec!["wA".into(), "wB".into()]),
+        tls: None,
+        bound_tx: Some(bound_tx),
+        max_jobs: Some(1),
+        job_tx: Some(job_tx),
+    };
+    std::thread::spawn(move || net::serve(cfg).expect("serve"));
+    let bound = bound_rx.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+
+    queue_desc(&jobs_dir, "job1", &desc);
+
+    let identities = root.join("identities");
+    std::fs::create_dir_all(&identities).unwrap();
+    // wA honest, wB corrupts its journal: 1v1 is no majority, the
+    // reserves are empty, so the zk judge arbitrates.
+    let spawns: Vec<(&str, bool)> = vec![("wA", false), ("wB", true)];
+    let mut handles = Vec::new();
+    for (id, corrupt) in spawns {
+        let server = bound.to_string();
+        let identity = identities.join(format!("{id}.key"));
+        let store_dir = root.join(format!("worker-store-{id}"));
+        handles.push(std::thread::spawn(move || {
+            run_daemon(&DaemonConfig {
+                server,
+                worker_id: id.into(),
+                identity_path: Some(identity),
+                store_dir,
+                listen_port: None,
+                tls: None,
+                corrupt,
+                corrupt_byte: None,
+                extra_submits: 0,
+                receipt_file: None,
+            })
+        }));
+    }
+
+    let job1 = wait_job(&job_rx);
+    let coordinator::Decision::Accept { hash, agreed, zk, .. } = &job1.decision else {
+        panic!("zk judge should accept the job, got {:?}", job1.decision);
+    };
+    assert!(*zk, "acceptance must be receipt-backed");
+    // The receipt vindicates the honest responder by digest...
+    assert_eq!(agreed, &vec!["wA".to_string()], "honest worker paid, liar not: {agreed:?}");
+    // ...and the hash is the honest worker's own commitment.
+    let honest = job1.results.iter().find(|r| r.worker_id == "wA").unwrap();
+    assert_eq!(hash, &honest.result_hash, "judge digest == honest digest");
+    let ledger = std::fs::read_to_string(root.join("ledger.json")).unwrap();
+    assert!(ledger.contains("\"wA\": 10"), "honest rewarded: {ledger}");
+    assert!(ledger.contains("\"wB\": -100"), "liar slashed: {ledger}");
     for h in handles {
         h.join().unwrap().unwrap();
     }

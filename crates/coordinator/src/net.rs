@@ -41,6 +41,10 @@ pub struct ServeConfig {
     /// claims, verified by an external verifier binary. None = receipt
     /// claims are refused.
     pub zk: Option<ZkVerify>,
+    /// zk dispute judge: when set, a no-majority job escalates to an
+    /// external SP1 prover process before falling back to the replay
+    /// judge. The receipt makes the verdict third-party checkable.
+    pub zk_judge: Option<crate::zk_judge::ZkJudge>,
     /// When true, authenticated connections may submit job descriptors
     /// over the wire; each lands in the watched jobs directory.
     pub accept_submissions: bool,
@@ -496,10 +500,19 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
                     // honest responders (even a lone one against a pool
                     // of no-shows) and convicts contradicting chains.
                     Decision::Escalate => {
-                        match judge_by_replay_network(&store, &job) {
+                        // Prefer the zk judge when configured: its
+                        // receipt makes the verdict third-party
+                        // checkable. Any failure (absent, oversized,
+                        // cycle-bound, timed out) falls back to the
+                        // replay judge — both are the coordinator's
+                        // own computation; zk adds verifiability.
+                        match zk_judge_network(&cfg, &store, &job) {
                             Some(d) => d,
-                            None => Decision::Reject {
-                                reason: "no majority; dispute judgment failed".into(),
+                            None => match judge_by_replay_network(&store, &job) {
+                                Some(d) => d,
+                                None => Decision::Reject {
+                                    reason: "no majority; dispute judgment failed".into(),
+                                },
                             },
                         }
                     }
@@ -943,6 +956,73 @@ fn judge_by_replay_network(
         }
     }
     Some(Decision::Accept { hash: truth_digest, output_hex, agreed, zk: false })
+}
+
+/// The zk dispute judge over the network path: materialize the job
+/// (the same hash-verified blobs the workers saw), hand it to the
+/// external judge process, and turn a verified verdict into a
+/// decision. Returns None when no judge is configured or the judge
+/// failed for any reason — the caller falls back to the replay judge.
+/// The binding cross-check pins the verdict to THIS job's content
+/// ids; the digest is recomputed from the verdict's own values.
+fn zk_judge_network(
+    cfg: &ServeConfig,
+    store: &contentstore::Store,
+    job: &PendingJob,
+) -> Option<Decision> {
+    let Some(zk) = &cfg.zk_judge else { return None };
+    let dir = std::env::temp_dir().join(format!(
+        "p2pc-zkjudge-{}-{}",
+        std::process::id(),
+        job.descriptor.job_id
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    contentstore::materialize(&job.descriptor, store, &dir).ok()?;
+    let result = crate::zk_judge::run_judge(zk, &dir, &job.descriptor.job_id)
+        .and_then(|verdict| {
+            // The descriptor's content ids are plain hex; decode each
+            // and require exactly 32 bytes (the content store's ids).
+            let decode32 = |h: &str| -> Result<[u8; 32], String> {
+                let bytes = jobfmt::from_hex(h, 32).map_err(|e| format!("content id: {e}"))?;
+                bytes.try_into().map_err(|_| "content id length".to_string())
+            };
+            let expected_binding = [
+                decode32(&job.descriptor.manifest)?,
+                decode32(&job.descriptor.elf)?,
+                decode32(&job.descriptor.input)?,
+            ];
+            crate::zk_judge::judge_decision(&verdict, &expected_binding)
+        });
+    let _ = std::fs::remove_dir_all(&dir);
+    match result {
+        Ok(d) => {
+            // A receipt-backed accept vindicates the responders whose
+            // result matches it — same semantics as the replay judge:
+            // matching workers are paid, contradicting ones burned by
+            // slashing (agreed stays empty only when nobody answered).
+            let vindicated = match d {
+                Decision::Accept { hash, output_hex, zk: true, .. } => {
+                    let agreed: Vec<String> = job
+                        .results
+                        .iter()
+                        .filter(|r| r.chunk_hashes.len() == 1 && r.chunk_hashes[0] == hash)
+                        .map(|r| r.worker_id.clone())
+                        .collect();
+                    Decision::Accept { hash, output_hex, agreed, zk: true }
+                }
+                other => other,
+            };
+            eprintln!(
+                "[net] zk judge resolved job {}: receipt-backed verdict",
+                job.descriptor.job_id
+            );
+            Some(vindicated)
+        }
+        Err(e) => {
+            eprintln!("[net] zk judge unavailable for {}: {e} — falling back to replay", job.descriptor.job_id);
+            None
+        }
+    }
 }
 
 /// Validate and land a remotely submitted job descriptor. The
