@@ -172,6 +172,18 @@ jobs:
           P2PC_ZK_GUEST_ELF: ${{ github.workspace }}/sp1-artifacts/sp1-guest-emu.elf
         run: cargo test -p coordinator --test network zk_receipt_claim_accepts_job -- --nocapture
 
+      - name: zk dispute judge over the wire (mock prover)
+        # SP1_PROVER=mock runs the full judge state machine — execute,
+        # binding check, rvcore cross-check, receipt "proof", verdict,
+        # vindication, slashing — without a proving-sized memory
+        # envelope. Real-prover runs live in the Linux proving
+        # container (docs/DESIGN.md has the measured envelope).
+        env:
+          SP1_PROVER: mock
+          P2PC_ZK_JUDGE_CMD: ${{ github.workspace }}/sp1-host/target/release/zk-judge
+          P2PC_ZK_JUDGE_GUEST_ELF: ${{ github.workspace }}/elf/sp1-guest-emu
+        run: cargo test -p coordinator --test network zk_judge_dispute_receipt_vindicates_honest_worker -- --nocapture
+
   coverage:
     # Line-coverage floor over the verification-critical crates, so
     # security-relevant code cannot silently lose its tests.

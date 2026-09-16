@@ -401,6 +401,57 @@ have no such limit. Documented here because the failure mode is a
 silent crash in a child process, invisible in the worker's own logs
 beyond the error string.
 
+## Step 2: SP1 prove() as the dispute judge
+
+When a job ends with no worker majority and no reserves, the
+coordinator can escalate to an external `zk-judge` process (built from
+`sp1-host`) instead of relying on its own rvcore replay. The judge
+re-executes the disputed job inside the zkVM — the same
+emulator-as-guest as the worker path — and returns a **receipt**: the
+verdict becomes third-party checkable, not just coordinator-asserted.
+
+- **Fail fast before proving.** The judge executes first (cheap) and
+  refuses to prove when the VM cycle count exceeds
+  `--zk-judge-max-vm-cycles` (default 10M). An emulator inside a zkVM
+  multiplies job instructions ~300x, so the cycle bound — not the job
+  size — is the resource dial.
+- **The verdict is never trusted on faith.** The coordinator
+  recomputes the journal digest from the verdict's own (instruction
+  count, output) pair, cross-checks the guest's committed
+  (manifest, elf, input) binding against the descriptor's content
+  ids, and the judge binary itself cross-checks the zkVM execution
+  against its locally linked rvcore (catching a guest artifact that
+  drifted from the pinned semantics).
+- **Vindication, not blanket conviction.** A receipt-backed accept
+  pays the responders whose result matches the receipt and burns the
+  rest — the same ledger semantics as the replay judge.
+- **Fail-open to replay.** Judge absent, oversized, cycle-bound, or
+  timed out (`--zk-judge-timeout-secs`, default 1800) — the replay
+  judge arbitrates. Both are the coordinator's own computation; zk
+  adds verifiability, not correctness.
+
+**Measured envelope (8 CPU cores, 32 GB RAM, SP1 6.8 CPU prover,
+`core` proof mode):**
+
+| Job | rvcore instructions | VM cycles | execute | prove | peak RAM |
+|---|---|---|---|---|---|
+| nano | 16,410 | 5.94M | 0.1 s | **140 s** | **23.8 GB** |
+| smoke | 524,314 | 168.9M | 2.5 s | killed at 70 s | 31.8 GB (OOM) |
+
+Proving memory grows with the shard count (nano ≈ 3 shards, smoke ≈
+84), so the CPU-provable envelope on a 32 GB host ends near ~10M VM
+cycles (~22K emulated instructions). GPU proving (a CUDA machine is
+available) or a newer SP1 is the scale-out step. The meta-emulation
+multiplier is the structural cost of the ABI-preserving guest;
+replacing the guest emulator with an ABI trampoline (jobs compiled
+directly for SP1's I/O convention) would remove the ~300x factor for
+NEW jobs but abandons zero-migration compatibility — parked.
+
+CI runs the full judge state machine under `SP1_PROVER=mock` (no
+real cryptography, seconds); real-prover integration runs in the
+Linux proving container. The proving envelope numbers above are why
+the mock/real split exists.
+
 ## Known gaps (next milestones)
 
 1. Official `riscv-arch-test` suite (the full official riscv-tests

@@ -1,5 +1,8 @@
 use clap::Parser;
-use coordinator::{decide, dispute, ledger::Ledger, net, optimistic, slashing, verify_signature, Decision};
+use coordinator::{
+    decide, dispute, ledger::Ledger, net, optimistic, slashing, verify_signature, zk_judge,
+    Decision,
+};
 use jobfmt::WorkerResult;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -179,6 +182,28 @@ struct ServeArgs {
     /// verifying key from (sp1-artifacts/sp1-guest-emu.elf).
     #[arg(long)]
     zk_guest_elf: Option<PathBuf>,
+    /// zk dispute judge: the external zk-judge binary (built from
+    /// sp1-host). When set together with --zk-judge-guest-elf, a
+    /// no-majority job escalates to a zkVM re-execution whose receipt
+    /// is verified before the verdict lands — third-party checkable.
+    #[arg(long)]
+    zk_judge_cmd: Option<String>,
+    /// zk dispute judge: the guest ELF the judge executes
+    /// (elf/sp1-guest-emu).
+    #[arg(long)]
+    zk_judge_guest_elf: Option<PathBuf>,
+    /// zk dispute judge: fail fast BEFORE proving when the execution's
+    /// VM cycle count exceeds this. Measured envelope (docs/DESIGN.md):
+    /// 5.9M VM cycles = 140 s + 24 GB on 8 CPU cores; proving memory
+    /// grows with the shard count, so beyond ~10M VM cycles a 32 GB
+    /// host is not enough. Raise it only with hardware to match.
+    #[arg(long, default_value_t = 10_000_000)]
+    zk_judge_max_vm_cycles: u64,
+    /// zk dispute judge: hard wall-clock limit for the whole
+    /// invocation (execute + prove + verify). Expiry falls back to the
+    /// replay judge.
+    #[arg(long, default_value_t = 1800)]
+    zk_judge_timeout_secs: u64,
     /// Directory where each finished job's full outcome (decision,
     /// results, ledger deltas) is persisted as {job_id}.json — the raw
     /// material for evidence bundles. Required for `jobkit evidence`.
@@ -237,6 +262,16 @@ fn cmd_serve(args: ServeArgs) {
             (Some(cmd), Some(elf)) => Some(net::ZkVerify {
                 cmd: cmd.clone(),
                 guest_elf: elf.clone(),
+            }),
+            _ => None,
+        },
+        zk_judge: match (&args.zk_judge_cmd, &args.zk_judge_guest_elf) {
+            (Some(cmd), Some(elf)) => Some(zk_judge::ZkJudge {
+                cmd: cmd.clone(),
+                guest_elf: elf.clone(),
+                max_vm_cycles: args.zk_judge_max_vm_cycles,
+                timeout: std::time::Duration::from_secs(args.zk_judge_timeout_secs),
+                receipt_dir: args.results_dir.clone(),
             }),
             _ => None,
         },

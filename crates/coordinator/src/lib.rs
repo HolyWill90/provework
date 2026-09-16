@@ -3,6 +3,7 @@ pub mod ledger;
 pub mod net;
 pub mod optimistic;
 pub mod receipt;
+pub mod zk_judge;
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use jobfmt::WorkerResult;

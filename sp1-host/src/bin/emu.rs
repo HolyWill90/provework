@@ -125,7 +125,17 @@ fn main() {
     stdin.write(&input);
 
     if mode == "execute" {
-        let (mut pv, _report) = prover.execute(elf.clone(), stdin).run().expect("execute");
+        let t0 = std::time::Instant::now();
+        let (mut pv, report) = prover.execute(elf.clone(), stdin).run().expect("execute");
+        // The VM cycle count is the meta-emulation overhead baseline:
+        // rvcore instructions executed inside the zkVM cost this many
+        // VM cycles, which is what a prover would have to prove.
+        println!(
+            "sp1 execute: {} vm cycles in {:.1}s (rvcore reported {} job instructions)",
+            report.total_instruction_count(),
+            t0.elapsed().as_secs_f64(),
+            instructions,
+        );
         let binding_zk: [[u8; 32]; 3] = pv.read();
         assert_eq!(
             binding_zk,
@@ -148,7 +158,9 @@ fn main() {
     // found") in BOTH compressed and core modes, so receipts beyond one
     // shard await a newer SP1 or the GPU prover. Core is tried first
     // here as the more permissive path.
+    let t0 = std::time::Instant::now();
     let mut proof = prover.prove(&pk, stdin).core().run().expect("proving");
+    let proving_secs = t0.elapsed().as_secs_f64();
     let binding_zk: [[u8; 32]; 3] = proof.public_values.read();
     assert_eq!(
         binding_zk,
@@ -174,7 +186,8 @@ fn main() {
     std::fs::copy("../elf/sp1-guest-emu", "../sp1-artifacts/sp1-guest-emu.elf")
         .expect("copy guest ELF");
     println!(
-        "SP1 EMU PROVE PASS: verified receipt - rvcore on the actual job ELF produced {} ({} instruction(s), {} chunk(s))",
+        "SP1 EMU PROVE PASS: verified receipt in {:.1}s - rvcore on the actual job ELF produced {} ({} instruction(s), {} chunk(s))",
+        proving_secs,
         hex(&chain_zk.last().copied().unwrap_or_default()),
         instructions_zk,
         chain_zk.len(),

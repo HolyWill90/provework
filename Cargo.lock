@@ -618,6 +618,7 @@ dependencies = [
  "rvcore",
  "serde",
  "serde_json",
+ "sha2",
  "wire",
  "worker",
 ]
