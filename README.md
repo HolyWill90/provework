@@ -40,6 +40,15 @@ rustup target add riscv64imac-unknown-none-elf
 cargo run --release -p jobkit -- new my-job
 #    edit my-job/src/main.rs and my-job/input.bin
 
+# 1b. or scaffold a V2 (SP1-native) job: ~100x cheaper to prove, and
+#     verified by zk receipt without re-execution — but executable
+#     only by SP1 fleets. Build auto-routes through a pinned Docker
+#     toolchain when cargo-prove is not installed locally (one-time
+#     image build, then ~20s rebuilds from the mounted host caches).
+cargo run --release -p jobkit -- new my-v2-job --v2
+#    edit my-v2-job/guest/src/main.rs and my-v2-job/input.bin
+cargo run --release -p jobkit -- build my-v2-job
+
 # 2. compile for the sandbox + validate the ELF
 cargo run --release -p jobkit -- build my-job
 

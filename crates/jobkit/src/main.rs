@@ -23,7 +23,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Scaffold a sandbox-ready job crate.
-    New { name: String },
+    New {
+        name: String,
+        /// Scaffold an SP1-native (V2) job: compiled directly for the
+        /// zkVM — ~100x cheaper to prove than legacy jobs, but only
+        /// executable by SP1 fleets. Build auto-routes through Docker
+        /// when the SP1 toolchain is not installed locally.
+        #[arg(long)]
+        v2: bool,
+    },
     /// Compile the job for RISC-V and validate the ELF against the loader contract.
     Build { dir: PathBuf },
     /// Publish the job and submit it to a coordinator over the wire.
@@ -80,7 +88,7 @@ enum Cmd {
 
 fn main() {
     match Cli::parse().cmd {
-        Cmd::New { name } => new_job(&name),
+        Cmd::New { name, v2 } => new_job(&name, v2),
         Cmd::Build { dir } => build_job(&dir),
         Cmd::Submit {
             dir,
@@ -107,7 +115,10 @@ mod scaffold;
 use scaffold::*;
 
 
-fn new_job(name: &str) {
+fn new_job(name: &str, v2: bool) {
+    if v2 {
+        return new_job_v2(name);
+    }
     let dir = Path::new(name);
     if dir.exists() {
         eprintln!("error: {name} already exists");
@@ -141,9 +152,211 @@ fn new_job(name: &str) {
     println!("next: write your computation in src/main.rs, put your input in input.bin, then `jobkit build {name}`");
 }
 
+// ---------- V2 scaffold ----------
+
+fn new_job_v2(name: &str) {
+    let dir = Path::new(name);
+    if dir.exists() {
+        eprintln!("error: {name} already exists");
+        std::process::exit(1);
+    }
+    for sub in ["", "guest/src"] {
+        std::fs::create_dir_all(dir.join(sub)).expect("mkdir");
+    }
+    std::fs::write(
+        dir.join("guest/Cargo.toml"),
+        scaffold::V2_GUEST_CARGO_TOML.replace("{{NAME}}", &format!("{name}-guest")),
+    )
+    .unwrap();
+    std::fs::write(dir.join("guest/src/main.rs"), scaffold::V2_GUEST_MAIN_RS).unwrap();
+    let manifest_json = scaffold::V2_MANIFEST
+        .replace("{{NAME}}", name)
+        .replace("{{ID}}", &format!("{name}-0001"));
+    std::fs::write(dir.join("job.json"), manifest_json).unwrap();
+    std::fs::write(dir.join("input.bin"), scaffold::SCAFFOLD_SAMPLE_INPUT).unwrap();
+    println!("scaffolded V2 (SP1-native) job: {name}/");
+    println!("next: write your computation in guest/src/main.rs (read input via sp1_zkvm::io::read,");
+    println!("commit blake3(input), then your output), put your input in input.bin, then `jobkit build {name}`");
+    println!("(the build auto-routes through Docker when the SP1 toolchain is not installed locally)");
+}
+
 // ---------- build ----------
 
+/// The V2 toolchain image: built on demand from docker/sp1-toolchain.Dockerfile
+/// and reused thereafter. Per-build caches (cargo registry, guest target)
+/// are HOST-mounted, so only the first build pays for dependency downloads.
+const TOOLCHAIN_IMAGE: &str = "provework/sp1-toolchain:v2";
+
+/// Docker mount paths must not carry the Windows extended-length
+/// prefix (canonicalize produces \\?\C:\...); plain drive paths mount.
+fn docker_path(p: PathBuf) -> String {
+    let s = p.display().to_string();
+    s.strip_prefix("\\\\?\\").unwrap_or(&s).to_string()
+}
+
+fn docker_available() -> bool {
+    std::process::Command::new("docker")
+        .arg("info")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Ensure the pinned toolchain image exists locally, building it from
+/// the checked-in Dockerfile once.
+fn ensure_toolchain_image() {
+    let have = std::process::Command::new("docker")
+        .args(["image", "inspect", TOOLCHAIN_IMAGE])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if have {
+        return;
+    }
+    println!("building the SP1 toolchain image ({TOOLCHAIN_IMAGE}) — one-time, a few minutes");
+    // The Dockerfile lives at the repo root; resolve it relative to
+    // this crate (works for a repo checkout).
+    let dockerfile = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docker/sp1-toolchain.Dockerfile");
+    let root = dockerfile.parent().and_then(|p| p.parent()).expect("repo root").to_path_buf();
+    let status = std::process::Command::new("docker")
+        .args([
+            "build",
+            "-f",
+            dockerfile.to_str().expect("dockerfile path"),
+            "-t",
+            TOOLCHAIN_IMAGE,
+            root.to_str().expect("root"),
+        ])
+        .status()
+        .expect("docker build");
+    if !status.success() {
+        eprintln!("error: toolchain image build failed");
+        std::process::exit(1);
+    }
+}
+
+/// Cargo cache host-side: the registry survives across builds, so only
+/// the FIRST build downloads dependencies.
+fn cargo_cache_dir() -> PathBuf {
+    let home = std::env::var("USER_HOME")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| ".".into());
+    Path::new(&home).join(".cache/jobkit/cargo")
+}
+
+fn build_v2(dir: &Path) {
+    let guest = dir.join("guest");
+    if !guest.join("Cargo.toml").exists() {
+        eprintln!("error: no guest crate at {} (is this a V2 job?)", guest.display());
+        std::process::exit(1);
+    }
+
+    // The guest's own target dir doubles as the container's target
+    // cache: incremental rebuilds stay on the host across invocations.
+    let target = guest.join("target");
+    std::fs::create_dir_all(&target).expect("guest target dir");
+    std::fs::create_dir_all(cargo_cache_dir()).expect("cargo cache dir");
+    let guest_s = docker_path(guest.canonicalize().expect("guest path"));
+    let target_s = docker_path(target.canonicalize().expect("target path"));
+    let cache_s = docker_path(cargo_cache_dir().canonicalize().expect("cache path"));
+
+    // Dual-path auto-detection: native cargo-prove when present
+    // (Linux dev boxes), the pinned container otherwise (Windows,
+    // macOS, toolchain-less Linux).
+    let native = std::process::Command::new("cargo")
+        .args(["prove", "--version"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+
+    let status = if native {
+        println!("building V2 guest with the local SP1 toolchain");
+        std::process::Command::new("cargo")
+            .args(["prove", "build"])
+            .env("CARGO_TARGET_DIR", &target)
+            .current_dir(&guest)
+            .status()
+            .expect("cargo prove")
+    } else {
+        if !docker_available() {
+            eprintln!(
+                "error: Docker daemon not found. Install Docker or run on Linux with the SP1 toolchain in PATH to build SP1 V2 ELFs."
+            );
+            std::process::exit(1);
+        }
+        ensure_toolchain_image();
+        println!("building V2 guest in {TOOLCHAIN_IMAGE}");
+        std::process::Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "-v",
+                &format!("{guest_s}:/build/job"),
+                "-v",
+                &format!("{cache_s}:/build/cargo-home"),
+                "-v",
+                &format!("{target_s}:/build/target"),
+                "-e",
+                "CARGO_HOME=/build/cargo-home",
+                "-e",
+                "CARGO_TARGET_DIR=/build/target",
+                "-w",
+                "/build/job",
+                TOOLCHAIN_IMAGE,
+                "cargo",
+                "prove",
+                "build",
+            ])
+            .status()
+            .expect("docker run")
+    };
+    if !status.success() {
+        eprintln!("error: V2 guest build failed");
+        std::process::exit(1);
+    }
+
+    // Hermetic output: the manifest's elf name, in the job dir, plus
+    // the BLAKE3 content id `jobkit publish` will address it by.
+    let elf_dir = target.join("elf-compilation/riscv64im-succinct-zkvm-elf/release");
+    let built = std::fs::read_dir(&elf_dir)
+        .expect("built ELF directory")
+        .flatten()
+        .find(|e| {
+            e.path().extension().is_none_or(|x| x.is_empty())
+                && e.metadata().is_ok_and(|m| m.is_file() && m.len() > 4)
+        })
+        .map(|e| e.path())
+        .unwrap_or_else(|| {
+            eprintln!("error: built ELF not found in {elf_dir:?}");
+            std::process::exit(1);
+        });
+    let bytes = std::fs::read(&built).expect("read ELF");
+    std::fs::copy(&built, dir.join("program.elf")).expect("install program.elf");
+    let id: [u8; 32] = blake3::hash(&bytes).into();
+    println!(
+        "program.elf installed: {} bytes, blake3 {}",
+        bytes.len(),
+        id.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    );
+    println!("(this is the content id the descriptor and receipts bind to)");
+}
+
+// ---------- build (legacy rv-abi) ----------
+
 fn build_job(dir: &Path) {
+    // The job's manifest selects the pipeline: sp1-v2 jobs compile
+    // against the SP1 toolchain; everything else is the legacy rv-abi
+    // flow.
+    if let Ok(bytes) = std::fs::read(dir.join("job.json")) {
+        if let Ok(manifest) = serde_json::from_slice::<jobfmt::JobManifest>(&bytes) {
+            if manifest.is_sp1_v2() {
+                return build_v2(dir);
+            }
+        }
+    }
     let status = std::process::Command::new("cargo")
         .args(["build", "--release"])
         .current_dir(dir)
@@ -159,7 +372,7 @@ fn build_job(dir: &Path) {
         .flatten()
         .find(|e| {
             e.path().extension().is_none_or(|x| x.is_empty())
-                && e.metadata().is_ok_and(|m| m.len() > 4)
+                && e.metadata().is_ok_and(|m| m.is_file() && m.len() > 4)
         })
         .map(|e| e.path())
         .unwrap_or_else(|| {

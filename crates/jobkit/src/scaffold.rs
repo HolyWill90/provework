@@ -152,3 +152,59 @@ pub const SCAFFOLD_MANIFEST: &str = r#"{
 }"#;
 
 pub const SCAFFOLD_SAMPLE_INPUT: &[u8] = b"provework sample input\n";
+
+// ---------- V2 (SP1-native) scaffold ----------
+
+pub const V2_GUEST_CARGO_TOML: &str = r#"[package]
+name = "{{NAME}}"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+sp1-zkvm = "6.8.0"
+blake3 = { version = "1", default-features = false }
+"#;
+
+pub const V2_GUEST_MAIN_RS: &str = r#"//! Your V2 (SP1-native) job. This program runs DIRECTLY inside the
+//! SP1 zkVM — no emulator in the loop, ~100x cheaper to prove than
+//! legacy jobs — but it is only executable by SP1 fleets.
+//!
+//! Protocol: read your input via `sp1_zkvm::io::read::<Vec<u8>>()`,
+//! commit `blake3(input)` first (the binding verifiers pin receipts
+//! with), then commit your output. Deterministic integer logic only:
+//! no network, filesystem, clock, randomness, or floats.
+
+#![no_main]
+sp1_zkvm::entrypoint!(main);
+
+fn main() {
+    let input: Vec<u8> = sp1_zkvm::io::read();
+    let input_id: [u8; 32] = blake3::hash(&input).into();
+    sp1_zkvm::io::commit(&input_id);
+
+    // TODO: your computation here. Replace this FNV hash with your
+    // actual logic — anything deterministic and integer-only.
+    let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in &input {
+        acc = (acc ^ b as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    let output = acc.to_le_bytes().to_vec();
+    sp1_zkvm::io::commit(&output);
+}
+"#;
+
+pub const V2_MANIFEST: &str = r#"{
+  "schema": 1,
+  "id": "{{ID}}",
+  "name": "{{NAME}}",
+  "isa": "rv64imc",
+  "format": "sp1-v2",
+  "toolchain": "sp1 6.8.0 (riscv64im-succinct-zkvm-elf)",
+  "chunk_size": 1048576,
+  "max_instructions": 1000000000,
+  "verification_class": "quorum3",
+  "elf": "program.elf",
+  "input": "input.bin"
+}"#;
