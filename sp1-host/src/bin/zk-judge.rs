@@ -18,10 +18,15 @@
 //! cryptography) — used by CI to exercise the full judge state machine
 //! without a proving-sized memory envelope.
 
-use sp1_sdk::blocking::{Elf, ProveRequest, Prover, ProverClient, SP1Stdin};
+// The ASYNC SDK, under #[tokio::main]: SP1 6.8's blocking wrapper
+// cannot construct the CUDA prover (its builder needs a Tokio
+// reactor). The async API serves cpu, mock, and cuda uniformly — the
+// prover kind stays a runtime choice via SP1_PROVER.
+use sp1_sdk::{Elf, ProveRequest, Prover, ProverClient, SP1Stdin};
 use sp1_sdk::ProvingKey as _;
 
-fn main() {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (job_dir, max_cycles, guest_elf, receipt_out) = match args.as_slice() {
         [j, m, g] => (j.clone(), m.clone(), g.clone(), None),
@@ -33,7 +38,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    match run(&job_dir, &max_cycles, &guest_elf, receipt_out.as_deref()) {
+    match run(&job_dir, &max_cycles, &guest_elf, receipt_out.as_deref()).await {
         Ok(v) => println!("{v}"),
         Err(e) => {
             println!("{{\"ok\":false,\"error\":{}}}", serde_json::to_string(&e).unwrap());
@@ -76,7 +81,7 @@ fn read_committed(
     (binding, status, instructions, chain, output)
 }
 
-fn run(
+async fn run(
     job_dir: &str,
     max_cycles: &str,
     guest_elf_path: &str,
@@ -94,7 +99,7 @@ fn run(
     ];
     let binding_hex: Vec<String> = binding.iter().map(|h| hex(h)).collect();
 
-    let prover = ProverClient::from_env();
+    let prover = ProverClient::from_env().await;
     let elf = Elf::Dynamic(guest_bytes.into());
 
     // 1. Cheap pass: execute only. This yields the VM cycle count the
@@ -105,7 +110,7 @@ fn run(
     stdin.write(&job.input);
     let (mut pv, report) = prover
         .execute(elf.clone(), stdin)
-        .run()
+        .await
         .map_err(|e| format!("execute: {e}"))?;
     let vm_cycles = report.total_instruction_count();
     if vm_cycles > max_cycles {
@@ -150,7 +155,10 @@ fn run(
     }
 
     // 3. The proof. Fail-fast above already bounded the trace.
-    let pk = prover.setup(elf.clone()).map_err(|e| format!("setup: {e}"))?;
+    let pk = prover
+        .setup(elf.clone())
+        .await
+        .map_err(|e| format!("setup: {e}"))?;
     let mut stdin = SP1Stdin::new();
     stdin.write(&job.manifest_bytes);
     stdin.write(&job.elf);
@@ -159,7 +167,7 @@ fn run(
     let mut proof = prover
         .prove(&pk, stdin)
         .core()
-        .run()
+        .await
         .map_err(|e| format!("prove: {e}"))?;
     let proving_secs = t0.elapsed().as_secs_f64();
 

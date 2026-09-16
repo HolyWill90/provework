@@ -452,6 +452,57 @@ real cryptography, seconds); real-prover integration runs in the
 Linux proving container. The proving envelope numbers above are why
 the mock/real split exists.
 
+**GPU proving: measured, gated by hardware.** The CUDA path is fully
+wired and was verified to the gate on a real GPU host (GTX 1660
+SUPER, 6 GB): the `cuda` feature builds, SP1's `sp1-gpu-server`
+downloads and launches, driver passthrough works — and then the
+server refuses outright: `Unsupported GPU memory: 10, must be at
+least 24GB`. SP1 6.8's GPU prover has a hard 24 GB VRAM floor; this
+is a gate, not a tuning knob. The proving envelope therefore remains
+CPU-bound until a ≥24 GB GPU is available, at which point the same
+binaries switch over with `SP1_PROVER=cuda` — no code change. Two
+operational notes from the attempt, both now documented by this
+entry: the gpu-server needs `libcudart.so.12` (install
+`cuda-cudart-12-6`; the driver passthrough provides libcuda but not
+cudart), and the zk-judge binary must use the async SDK — SP1 6.8's
+blocking wrapper cannot construct the CUDA prover (no Tokio reactor
+at builder time).
+
+## Step 3: direct zk receipts as a product tier (high-assurance jobs)
+
+A submitter can now ask for a **receipt-backed result** outright
+(`jobkit submit --require-zk`): the coordinator skips worker consensus
+entirely — one cryptographic proof replaces the quorum, the same
+semantics as a verified receipt claim — and proves the job in its own
+zkVM through the same external zk-judge process the dispute path uses.
+
+- **Proving is decoupled from the request path.** The submission ack
+  returns immediately (`proving: true`); the job sits in a FIFO
+  proving queue serviced by a dedicated thread; the `JobOutcome`
+  arrives when the proof lands. A client connection is never blocked
+  by proving time (nano ≈ 2.5 min on CPU).
+- **Receipt deduplication.** Execution is deterministic, so the same
+  (manifest, elf, input) always proves to the same receipt. Receipts
+  are cached under `{results_dir}/zk-cache/` keyed by
+  `BLAKE3(manifest_id ‖ elf_id ‖ input_id)` — content ids, not job
+  ids, so a second requester with the same content pays nothing for a
+  receipt someone already paid for. A cache hit is NEVER trusted on
+  faith: it is re-verified through the standalone zk-verify binary
+  against the requesting job's binding; without a verifier configured,
+  cache hits are refused and the job re-proves (fail-closed).
+- **Client-side verification.** `jobkit evidence` bundles the receipt
+  alongside the outcome; `jobkit verify --zk-verify <bin> --guest-elf
+  <elf> [--desc <descriptor>]` checks the proof offline — the
+  coordinator's word is not needed. With the descriptor it also pins
+  the receipt to the submitter's exact content ids ("this receipt is
+  for MY job", not merely "a valid receipt"). The verifier re-derives
+  the verifying key from the committed guest ELF (~1 s) — an
+  uninvolved third party with the bundle needs no prover and no
+  coordinator.
+- **Refusal is explicit.** A `require_zk` submission to a coordinator
+  without a prover is refused with a clear reason, not silently
+  downgraded to consensus.
+
 ## Known gaps (next milestones)
 
 1. Official `riscv-arch-test` suite (the full official riscv-tests

@@ -172,6 +172,18 @@ jobs:
           P2PC_ZK_GUEST_ELF: ${{ github.workspace }}/sp1-artifacts/sp1-guest-emu.elf
         run: cargo test -p coordinator --test network zk_receipt_claim_accepts_job -- --nocapture
 
+      - name: high-assurance proving queue with dedup (mock prover)
+        # require_zk submission -> queued -> receipt-backed outcome;
+        # a second identical submission is served from the cache after
+        # the cached receipt re-verifies (exactly one proof for two
+        # identical jobs).
+        env:
+          SP1_PROVER: mock
+          P2PC_ZK_JUDGE_CMD: ${{ github.workspace }}/sp1-host/target/release/zk-judge
+          P2PC_ZK_JUDGE_GUEST_ELF: ${{ github.workspace }}/elf/sp1-guest-emu
+          P2PC_ZK_VERIFY: ${{ github.workspace }}/sp1-host/target/release/zk-verify
+        run: cargo test -p coordinator --test network zk_proving_queue_end_to_end_with_dedup -- --nocapture
+
       - name: zk dispute judge over the wire (mock prover)
         # SP1_PROVER=mock runs the full judge state machine — execute,
         # binding check, rvcore cross-check, receipt "proof", verdict,

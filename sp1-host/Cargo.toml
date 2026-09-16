@@ -5,9 +5,18 @@ edition = "2021"
 
 [workspace]
 
+[features]
+# The GPU (CUDA) prover: SP1_PROVER=cuda at runtime selects it via
+# ProverClient::from_env(). Off by default — the cuda build pulls the
+# SP1 GPU kernels and only makes sense on a machine with an NVIDIA GPU.
+cuda = ["sp1-sdk/cuda"]
+
 [dependencies]
 # Keep in sync with the guest's sp1-zkvm version.
+# zk-judge uses the ASYNC sdk (see its header); the other bins use the
+# blocking re-exports, so the feature stays on for them.
 sp1-sdk = { version = "6.8.0", features = ["blocking"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 serde_json = "1"
 blake3 = { version = "1", default-features = false }
 jobfmt = { path = "../crates/jobfmt" }

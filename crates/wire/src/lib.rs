@@ -170,6 +170,13 @@ pub enum ClientToServer {
         descriptor: contentstore::JobDescriptor,
         pubkey_hex: String,
         sig_hex: String,
+        /// High-assurance mode: skip worker consensus entirely; the
+        /// coordinator's prover produces an SP1 receipt for the job
+        /// and the outcome is receipt-backed (`zk: true`). Proving is
+        /// queued, not synchronous — the ack returns immediately and
+        /// the JobOutcome arrives when the proof lands.
+        #[serde(default)]
+        require_zk: bool,
     },
     /// A zk receipt claim: the worker attaches a verified SP1 receipt
     /// for the whole job (hex of the bincode-serialized receipt). The
@@ -221,11 +228,15 @@ pub enum ServerToClient {
         rejected_reason: Option<String>,
     },
     /// Immediate reply to a JobSubmission: whether the descriptor
-    /// landed in the watched queue.
+    /// landed in the watched queue (or the zk proving queue).
     SubmissionAck {
         job_id: String,
         accepted: bool,
         reason: Option<String>,
+        /// True when the job was accepted into the zk proving queue
+        /// instead of worker dispatch (require_zk submissions).
+        #[serde(default)]
+        proving: bool,
     },
 }
 

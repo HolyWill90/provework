@@ -36,6 +36,12 @@ enum Cmd {
         /// Ed25519 identity for signing the submission (created on first use).
         #[arg(long, default_value = "submitter.key")]
         identity: PathBuf,
+        /// High-assurance mode: the coordinator proves the job in its
+        /// zkVM and returns a receipt-backed result (no worker
+        /// consensus). Proving is queued; the outcome arrives when the
+        /// proof lands. Requires the coordinator to run a zk prover.
+        #[arg(long)]
+        require_zk: bool,
     },
     /// Assemble a verifier-ready evidence bundle from a finished job.
     Evidence {
@@ -45,6 +51,26 @@ enum Cmd {
         job_id: String,
         #[arg(long, default_value = "evidence-bundle")]
         out: PathBuf,
+    },
+    /// Verify a receipt offline — no coordinator, no prover. Builds
+    /// the standalone zk-verify binary once (cargo build -p sp1-host
+    /// --bins on any Linux machine), then checks the proof against
+    /// the committed guest ELF. With --desc, also pins the receipt to
+    /// that exact job's (manifest, elf, input) content ids.
+    Verify {
+        #[arg(long, default_value = "evidence-bundle")]
+        bundle: PathBuf,
+        /// Path of the zk-verify binary (sp1-host/target/release/zk-verify).
+        #[arg(long)]
+        zk_verify: String,
+        /// The committed guest ELF the receipt was proven against.
+        #[arg(long)]
+        guest_elf: PathBuf,
+        /// The job's descriptor: when given, the receipt's committed
+        /// binding is required to match these content ids — "this
+        /// receipt is for MY job", not merely "a valid receipt".
+        #[arg(long)]
+        desc: Option<PathBuf>,
     },
 }
 
@@ -57,8 +83,15 @@ fn main() {
             store,
             server,
             identity,
-        } => submit(&dir, &store, &server, &identity),
+            require_zk,
+        } => submit(&dir, &store, &server, &identity, require_zk),
         Cmd::Evidence { results, job_id, out } => evidence(&results, &job_id, &out),
+        Cmd::Verify {
+            bundle,
+            zk_verify,
+            guest_elf,
+            desc,
+        } => verify(&bundle, &zk_verify, &guest_elf, desc.as_deref()),
     }
 }
 
@@ -167,7 +200,7 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn submit(dir: &Path, store: &Path, server: &str, identity: &Path) {
+fn submit(dir: &Path, store: &Path, server: &str, identity: &Path, require_zk: bool) {
     let manifest_bytes = std::fs::read(dir.join("job.json")).expect("job.json");
     let manifest: jobfmt::JobManifest = serde_json::from_slice(&manifest_bytes).expect("manifest");
     // Read to validate presence; the blobs themselves are served from
@@ -244,6 +277,7 @@ fn submit(dir: &Path, store: &Path, server: &str, identity: &Path) {
             descriptor: descriptor.clone(),
             pubkey_hex: hex(&key.verifying_key().to_bytes()),
             sig_hex: hex(&key.sign(&msg).to_bytes()),
+            require_zk,
         },
     )
     .unwrap();
@@ -251,12 +285,22 @@ fn submit(dir: &Path, store: &Path, server: &str, identity: &Path) {
     loop {
         match wire::receive::<wire::ServerToClient>(&mut stream) {
             Ok(wire::ServerToClient::SubmissionAck {
-                job_id, accepted, ..
+                job_id,
+                accepted,
+                reason,
+                proving,
             }) => {
                 if accepted {
-                    println!("submitted {job_id} — queued for execution");
+                    if proving {
+                        println!("submitted {job_id} — queued for zk proving");
+                    } else {
+                        println!("submitted {job_id} — queued for execution");
+                    }
                 } else {
-                    eprintln!("submission rejected");
+                    eprintln!(
+                        "submission rejected: {}",
+                        reason.as_deref().unwrap_or("unspecified")
+                    );
                     std::process::exit(1);
                 }
             }
@@ -308,5 +352,47 @@ fn evidence(results: &Path, job_id: &str, out: &Path) {
             )
         });
     println!("evidence bundle: {out:?}/outcome.json ({record_path} bytes)");
-    println!("an auditor re-verifies it by re-executing the job and comparing the chain");
+    let receipt = results.join(format!("{job_id}.receipt.bin"));
+    if receipt.exists() {
+        let n = std::fs::copy(&receipt, out.join("receipt.bin")).expect("copy receipt");
+        println!("receipt: {out:?}/receipt.bin ({n} bytes) — verifiable offline with `jobkit verify`");
+    } else {
+        println!("no zk receipt for this job (consensus- or judge-backed acceptance)");
+    }
+}
+
+/// Offline receipt verification: the client-side check that closes
+/// the trust loop — the coordinator's word is not needed.
+fn verify(bundle: &Path, zk_verify: &str, guest_elf: &Path, desc: Option<&Path>) {
+    let receipt = bundle.join("receipt.bin");
+    if !receipt.exists() {
+        eprintln!("no receipt.bin in bundle {} — nothing to verify", bundle.display());
+        std::process::exit(1);
+    }
+    let mut cmd = std::process::Command::new(zk_verify);
+    cmd.arg(guest_elf).arg(&receipt);
+    if let Some(d) = desc {
+        let bytes = std::fs::read(d).unwrap_or_else(|e| panic!("read {}: {e}", d.display()));
+        let descriptor: contentstore::JobDescriptor =
+            serde_json::from_slice(&bytes).expect("descriptor parse");
+        cmd.arg(&descriptor.manifest).arg(&descriptor.elf).arg(&descriptor.input);
+        println!("binding check: receipt must attest this descriptor's content ids");
+    }
+    let out = cmd.output().expect("run zk-verify");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let verdict: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("verifier output: {e} (raw: {stdout})"));
+    if verdict["ok"] != serde_json::Value::Bool(true) {
+        eprintln!("RECEIPT REJECTED: {}", verdict["error"].as_str().unwrap_or("?"));
+        std::process::exit(1);
+    }
+    println!("RECEIPT VERIFIED");
+    println!("  status:       {}", verdict["status"]);
+    println!("  instructions: {}", verdict["instructions"]);
+    if let Some(o) = verdict["output_hex"].as_str() {
+        println!("  output:       {o}");
+    }
+    if let Some(secs) = verdict["proving_secs"].as_f64() {
+        println!("  proved in:    {secs:.1}s (vm cycles: {})", verdict["vm_cycles"]);
+    }
 }
