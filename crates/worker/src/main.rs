@@ -63,8 +63,8 @@ struct DaemonArgs {
     /// Test hook: corrupt the result like a lying worker.
     #[arg(long)]
     corrupt: bool,
-    /// With --corrupt: the hex digit the last hash character becomes,
-    /// so two lying workers can fabricate DIFFERENT wrong results.
+    /// With --corrupt: the journal byte index to bump (defaults to
+    /// the last byte) — any bump guarantees divergence.
     #[arg(long)]
     corrupt_byte: Option<u8>,
     /// zk tier: submit this SP1 receipt (bincode) as a ReceiptClaim

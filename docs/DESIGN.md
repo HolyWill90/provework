@@ -334,12 +334,72 @@ honest worker and a liar, no majority forms, the coordinator escalates
 to the held-back honest reserve, and its result joins round 1's honest
 vote for a 2/3 accept while the liar's bond burns. A subtlety worth
 keeping: a corruption whose flipped byte lands on the honest value is
-indistinguishable from honesty — test flip values must be chosen against
-the honest tail.
+indistinguishable from honesty. This was eliminated rather than
+managed: `--corrupt-byte` now selects a journal byte to *bump*
+(±1 mod 256), and a bump can never round-trip to the original — no
+coincidence window exists at any byte.
 
 Deterministic round-1 membership: the coordinator names the round-1
 workers by id (`--round1-ids w1,w2,w5`), removing connection-order races
 from the dispatch decision.
+
+## Execution engine rebase, step 1: SP1 zkVM is the production executor
+
+The worker daemon gained a second execution path behind the `sp1`
+feature (Linux/production; the feature is not compiled on Windows dev
+machines because SP1's JIT backend is Linux-only). The design points
+that make the two paths interchangeable:
+
+- **The guest is the emulator.** SP1 cannot run the job ELF directly:
+  jobs use a bare-metal ABI (input/output at fixed addresses, `ebreak`
+  halt) that SP1's VM does not honor. Instead the pinned emulator
+  itself is the zkVM guest (`sp1-guest`, built to `elf/sp1-guest-emu`
+  and embedded into the worker binary at compile time). The job ELF
+  keeps its ABI; SP1 executes rvcore-on-the-job.
+- **The guest binds the job before executing.** It commits
+  `BLAKE3(manifest) ‖ BLAKE3(elf) ‖ BLAKE3(input)` first; the worker
+  re-derives the same triple from the materialized blobs and rejects
+  any mismatch. A wrong guest artifact or wrong job cannot be silently
+  executed.
+- **One journal format, one digest.** Both paths produce
+  `journal = u64 LE instruction count ‖ output` and commit to
+  `SHA-256(journal)`. The instruction count is the *guest's committed
+  rvcore count* — not SP1's VM cycle count, which is executor overhead
+  — so an SP1 worker and an rvcore worker produce comparable results.
+- **Honest status.** The guest commits an exit status (halted /
+  instruction-limit / trap) and the worker propagates it; the rvcore
+  path maps `ExitStatus` the same way. Trapped jobs are reported as
+  trapped.
+- **The judge reproduces the journal.** The network dispute judge
+  (`replay_journal`) re-executes from genesis with the same rvcore and
+  constructs the identical journal bytes — its verdict output is its
+  own replay's output, never a worker's claim. The judge must be
+  recompiled with the rvcore that the fleet executes; the zkVM guest
+  has the same constraint (a rebuilt `elf/sp1-guest-emu` must follow
+  any rvcore semantics change — rvcore is pinned, so this is a release
+  event, not a routine drift).
+- **Prover client sharing.** The SP1 CPU prover is constructed once
+  per process (`OnceLock`), not once per job — construction spins up
+  the whole worker machinery.
+
+What step 1 does NOT change: receipts. The Strong tier still verifies
+the committed nano receipt against the pinned
+`sp1-artifacts/sp1-guest-emu.elf`; refreshing that artifact with a
+fresh prover run is the receipt-tier rebase (a later step). Steps 2-3
+of the rebase (SP1 `prove()` as the dispute judge; direct receipts for
+high-value jobs) remain open.
+
+**Deployment constraint (SP1 executor):** SP1's JIT executor runs the
+guest in a child process backed by `/dev/shm`; if that tmpfs is too
+small for the workload's arena the child dies with SIGBUS — SP1's own
+runner logs "SIGBUS … there is a chance /dev/shm is full!". Docker's
+default `/dev/shm` is 64 MB, which executes the nano envelope fine but
+kills a ~524K-instruction job. Fleets running the `sp1` path must
+start their containers with `--shm-size` sized for the largest job
+(8 GB covers the current envelope with headroom); bare-metal hosts
+have no such limit. Documented here because the failure mode is a
+silent crash in a child process, invisible in the worker's own logs
+beyond the error string.
 
 ## Known gaps (next milestones)
 

@@ -120,6 +120,29 @@ pub struct WorkerResult {
     pub sig_hex: Option<String>,
 }
 
+/// The consensus journal format: 8-byte little-endian instruction
+/// count followed by the job's output bytes. Workers commit to
+/// SHA-256(journal); the coordinator's replay judge must reproduce
+/// the exact same bytes, so both construct it through this function.
+pub fn journal(instructions: u64, output: &[u8]) -> Vec<u8> {
+    let mut j = instructions.to_le_bytes().to_vec();
+    j.extend_from_slice(output);
+    j
+}
+
+/// The output portion of a [`journal`]: everything after the 8-byte
+/// instruction-count prefix.
+pub fn journal_output(journal: &[u8]) -> &[u8] {
+    journal.get(8..).unwrap_or(&[])
+}
+
+/// The consensus commitment: SHA-256 over [`journal`]. Workers submit
+/// this as `result_hash`; the replay judge reproduces it for compare.
+pub fn journal_digest(instructions: u64, output: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(journal(instructions, output)).into()
+}
+
 /// The exact bytes a worker signs and a coordinator verifies: a
 /// length-prefixed encoding of every result field except the key and
 /// signature themselves. Explicit encoding rather than JSON so the

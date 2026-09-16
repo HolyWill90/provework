@@ -61,15 +61,28 @@ cargo run --release -p jobkit -- evidence \
 
 ## Verification tiers
 
-Every execution emits a BLAKE3 hash chain over the machine's entire
-architectural state (registers, pc, machine CSRs, memory digest). One
-chain, three selectable verification tiers:
+Every execution emits a **journal** — the 8-byte little-endian
+instruction count followed by the job's output bytes — and workers
+commit to `SHA-256(journal)`. The coordinator's dispute judge
+re-executes the job and reproduces the identical bytes, so a verdict is
+never a worker's claim about the output; it is the judge's own output.
+One journal, three selectable verification tiers:
 
 | Tier | Mechanism | Trust removed | Cost | Status |
 |---|---|---|---|---|
 | Budget | Quorum, bond slashing, dispute judge | Workers agreeing on a fake result | ~N× | live |
-| Standard | Optimistic acceptance + one-slice dispute judgment | Same, at 1× unless challenged | ~1× | implemented (CLI/library) |
-| Strong | SP1 zkVM receipt **over the emulator itself executing your actual job** | Everything: no trust in any worker | prover tax | **receipt verified and accepted by the network** (nano envelope) |
+| Standard | Optimistic acceptance + replay judgment | Same, at 1× unless challenged | ~1× | implemented |
+| Strong | SP1 zkVM receipt **over the emulator itself executing your actual job** | Everything: no trust in any worker | prover tax | receipt verified and accepted by the network (nano envelope) |
+
+**Execution engine (two paths, one semantics).** Production workers
+execute jobs inside SP1's zkVM: the guest program *is* the pinned
+emulator (`elf/sp1-guest-emu`, embedded at build time), so the job ELF
+keeps its sandbox ABI and every worker runs the same instruction
+semantics inside SP1's deterministic VM — with the guest committing a
+BLAKE3 binding of `(manifest, elf, input)` before executing, so a
+mismatched guest or job cannot be silently accepted. Windows dev builds
+run the same emulator natively (`crates/rvcore`); the semantics, journal
+format, and digests are identical across both paths.
 
 See `docs/DESIGN.md` for the decision log, `docs/QUALIFYING.md` for
 whether your workload fits, and `docs/overview.html` for a visual
@@ -121,6 +134,7 @@ jobs/conformance     ISA corner-case suite (explicit inline asm, both impls)
 jobs/agent-task      the agent-work pilot job (see docs/PILOT.md)
 sp1-guest/           zkVM guests: the algorithm (fnv) and the emulator (emu)
 sp1-host/            prover + zk-verify oracle + receipt artifacts
+elf/                 the SP1 guest ELF embedded into production workers
 scripts/             packaging + validation + two-party pilot scripts
 docs/                DESIGN.md (decision log), QUALIFYING.md, PILOT.md, overview.html
 ```

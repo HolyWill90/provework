@@ -308,7 +308,7 @@ fn tls_network_session() {
     assert_eq!(agreed.len(), 2, "both TLS workers agreed");
 
     // Digest sanity: matches the known demo-hash-smoke result.
-    assert_eq!(hash, "67925f935808b41f326dd1f183e8e2951ac8d01f647e0d987f2cefa8944879b5");
+    assert_eq!(hash, "b4674657d1b9ac50f6d3f222c72d0c132ef03ce7ca8c417060d2492784dc80a6");
 
     for h in handles {
         h.join().unwrap().unwrap();
@@ -372,7 +372,7 @@ fn reserve_escalation_beats_lying_worker() {
     // wC, whose result joins wA's for the 2/3 accept.
     let spawns: Vec<(&str, bool, Option<u8>)> = vec![
         ("wA", false, None),
-        ("wB", true, Some(9)), // honest tail is 5 — 9 diverges
+        ("wB", true, Some(9)), // journal byte 9 bumped — divergence is guaranteed
         ("wC", false, None),
     ];
     for (id, corrupt, byte) in spawns {
@@ -399,7 +399,7 @@ fn reserve_escalation_beats_lying_worker() {
     let coordinator::Decision::Accept { hash, agreed, .. } = &job1.decision else {
         panic!("escalation should end in accept, got {:?}", job1.decision);
     };
-    assert_eq!(hash, "67925f935808b41f326dd1f183e8e2951ac8d01f647e0d987f2cefa8944879b5");
+    assert_eq!(hash, "b4674657d1b9ac50f6d3f222c72d0c132ef03ce7ca8c417060d2492784dc80a6");
     assert_eq!(agreed, &vec!["wA".to_string(), "wC".to_string()]);
     for h in handles {
         h.join().unwrap().unwrap();
@@ -745,7 +745,7 @@ fn duplicate_submissions_do_not_stuff_quorum() {
     assert!(!*zk, "resolved by dispute judgment, not a zk receipt");
     assert_eq!(
         hash,
-        "67925f935808b41f326dd1f183e8e2951ac8d01f647e0d987f2cefa8944879b5"
+        "b4674657d1b9ac50f6d3f222c72d0c132ef03ce7ca8c417060d2492784dc80a6"
     );
     assert_eq!(agreed, &vec!["wA".to_string()]);
     let ledger = std::fs::read_to_string(root.join("ledger.json")).unwrap();
@@ -929,7 +929,7 @@ fn dispute_judge_convicts_diverging_fabrications() {
     // The judge reports the TRUE result...
     assert_eq!(
         hash,
-        "67925f935808b41f326dd1f183e8e2951ac8d01f647e0d987f2cefa8944879b5"
+        "b4674657d1b9ac50f6d3f222c72d0c132ef03ce7ca8c417060d2492784dc80a6"
     );
     // ...and vindicates nobody: both fabrications contradicted it.
     assert!(agreed.is_empty(), "both liars must be convicted: {agreed:?}");

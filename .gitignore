@@ -10,7 +10,11 @@ sp1-exit.txt
 # bound to its exact bytes, so it is versioned, not rebuilt
 !jobs/demo-hash-nano/program.elf
 sp1-guest/elf/
-elf/
+elf/*
+!elf/sp1-guest-emu
+# the production worker embeds this guest at compile time (include_bytes!)
+# — it must be versioned for CI's sp1-feature check and fresh Linux builds
+!elf/sp1-guest-emu
 *.key
 identities-net/
 worker-store*/

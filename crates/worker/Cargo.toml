@@ -3,6 +3,9 @@ name = "worker"
 version.workspace = true
 edition.workspace = true
 
+[features]
+sp1 = ["dep:sp1-sdk"]
+
 [dependencies]
 abi = { workspace = true }
 rvcore = { workspace = true }
@@ -14,4 +17,6 @@ rustls = { workspace = true }
 serde_json = { workspace = true }
 ed25519-dalek = { workspace = true }
 blake3 = { workspace = true }
+sha2 = "0.10"
+sp1-sdk = { version = "6.8.0", features = ["blocking"], optional = true }
 rand_core = { workspace = true }
