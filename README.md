@@ -201,4 +201,7 @@ halt: execute `ebreak`   |   ISA pin: rv64imc (no atomics, no FP)
 ## License
 
 Dual-licensed under MIT or Apache-2.0, at your option (see
-LICENSE-MIT and LICENSE-APACHE).
+LICENSE-MIT and LICENSE-APACHE). Job code you scaffold and write is
+yours to license however you want — the templates impose nothing.
+Licensing decisions and the recorded revisit triggers:
+`docs/LICENSE-STRATEGY.md`.

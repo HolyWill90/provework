@@ -32,5 +32,6 @@ rustls = { version = "0.23.45", features = ["ring"] }
 rcgen = "0.13"
 
 [workspace.package]
+license = "MIT OR Apache-2.0"
 version = "0.1.0"
 edition = "2021"
