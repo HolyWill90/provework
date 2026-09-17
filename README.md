@@ -55,20 +55,22 @@ cargo run --release -p jobkit -- build my-v2-job
 # 2. compile for the sandbox + validate the ELF
 cargo run --release -p jobkit -- build my-job
 
-# 3b. run as Party A — start the coordinator (TLS + admission PoW)
+# 3b. run as Party A — start the coordinator (TLS + admission PoW).
+#     This runs in the FOREGROUND — it blocks this terminal. Open a
+#     second terminal for Party B. First run compiles for a few minutes.
 ./scripts/party-a.sh
 #    Party A prints its certificate path (./provework-demo/store/
 #    coordinator-cert.der) — workers and submitters pin its fingerprint.
 
-# 3a. run as Party B — join a coordinator's fleet as an untrusted
-#     executor. Copy the coordinator's certificate first (on one
-#     machine: cp <party-a-work>/store/coordinator-cert.der .), then:
+# 3a. in the SECOND terminal, run as Party B — join the coordinator's
+#     fleet as an untrusted executor. Copy the coordinator's
+#     certificate first (on one machine: cp <party-a-work>/store/
+#     coordinator-cert.der .), then:
 ./scripts/party-b.sh <coordinator-addr> worker-1 coordinator-cert.der
 
-# 4. Party A publishes + submits the job; Party B's fleet executes it.
-#    jobkit submit uploads the job's blobs, signs the submission, and
-#    pins the coordinator's TLS fingerprint — one step from the job
-#    owner's machine:
+# 4. in a THIRD terminal: submit the job. jobkit uploads the job's
+#    blobs, signs the submission, pins the coordinator's TLS
+#    fingerprint, and WAITS until the job is verified:
 cargo run --release -p jobkit -- submit my-job \
     --server <coordinator-addr> --store ./p2pc-store --identity submitter.key \
     --server-cert coordinator-cert.der
