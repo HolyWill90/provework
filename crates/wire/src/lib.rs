@@ -178,6 +178,11 @@ pub enum ClientToServer {
         #[serde(default)]
         require_zk: bool,
     },
+    /// A job blob upload from an authenticated submitter whose store
+    /// is not the coordinator's filesystem: the bytes are accepted
+    /// only if BLAKE3(bytes) == id_hex (content-addressed trust), and
+    /// land in the coordinator's store under that id.
+    BlobUpload { id_hex: String, bytes_hex: String },
     /// A zk receipt claim: the worker attaches a verified SP1 receipt
     /// for the whole job (hex of the bincode-serialized receipt). The
     /// signature is over `jobfmt::receipt_claim_message`.
@@ -227,6 +232,9 @@ pub enum ServerToClient {
         zk: bool,
         rejected_reason: Option<String>,
     },
+    /// Reply to a BlobUpload: whether the blob was accepted (hash
+    /// verified) and stored.
+    BlobAck { id_hex: String, accepted: bool, reason: Option<String> },
     /// Immediate reply to a JobSubmission: whether the descriptor
     /// landed in the watched queue (or the zk proving queue).
     SubmissionAck {

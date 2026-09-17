@@ -139,6 +139,7 @@ fn new_job(name: &str, v2: bool) {
         SCAFFOLD_README.replace("{{NAME}}", name),
     )
     .unwrap();
+    std::fs::write(dir.join("abi/Cargo.toml"), scaffold::SCAFFOLD_ABI_CARGO_TOML).unwrap();
     std::fs::write(dir.join("abi/abi.rs"), SCAFFOLD_ABI_RS).unwrap();
     std::fs::write(dir.join("abi/mod.rs"), "pub mod abi;\n").unwrap();
     std::fs::write(dir.join("src/main.rs"), SCAFFOLD_MAIN_RS).unwrap();
@@ -487,6 +488,49 @@ fn submit(dir: &Path, store: &Path, server: &str, identity: &Path, require_zk: b
         }
         other => panic!("unexpected during auth: {other:?}"),
     }
+
+    // Cross-machine path: the coordinator's store is not our
+    // filesystem, so the three blobs travel over the wire first,
+    // hash-verified on arrival. Over-sized blobs are rejected here
+    // with a clear message rather than mid-upload.
+    const MAX_BLOB_BYTES: usize = 16 * 1024 * 1024;
+    for (label, id_hex) in [
+        ("manifest", &descriptor.manifest),
+        ("elf", &descriptor.elf),
+        ("input", &descriptor.input),
+    ] {
+        let id = contentstore::ContentId::from_hex(id_hex).expect("content id");
+        let bytes = store.get(&id).unwrap_or_else(|e| panic!("read {label}: {e}"));
+        if bytes.len() > MAX_BLOB_BYTES {
+            eprintln!(
+                "error: {label} is {} bytes — over the {}-byte upload limit",
+                bytes.len(),
+                MAX_BLOB_BYTES
+            );
+            std::process::exit(1);
+        }
+        wire::send(
+            &mut stream,
+            &wire::ClientToServer::BlobUpload {
+                id_hex: id_hex.clone(),
+                bytes_hex: hex(&bytes),
+            },
+        )
+        .unwrap();
+        match wire::receive::<wire::ServerToClient>(&mut stream).expect("blob ack") {
+            wire::ServerToClient::BlobAck { accepted, reason, .. } => {
+                if !accepted {
+                    eprintln!(
+                        "error: coordinator rejected {label} upload: {}",
+                        reason.as_deref().unwrap_or("?")
+                    );
+                    std::process::exit(1);
+                }
+            }
+            other => panic!("expected BlobAck, got {other:?}"),
+        }
+    }
+    println!("blobs uploaded (3) — hash-verified by the coordinator");
 
     wire::send(
         &mut stream,

@@ -1074,11 +1074,14 @@ fn zk_judge_dispute_receipt_vindicates_honest_worker() {
 
 /// A minimal authenticated submitter client: Hello, PoW nonce, then
 /// the submission. Returns the open stream after the ack round-trip.
+#[allow(clippy::too_many_arguments)]
 fn connect_submitter(
     addr: &str,
     key: &ed25519_dalek::SigningKey,
     require_zk: bool,
     descriptor: &contentstore::JobDescriptor,
+    uploads: Option<&contentstore::Store>,
+    submit: bool,
 ) -> std::net::TcpStream {
     use ed25519_dalek::Signer;
     use wire::{ClientToServer, ServerToClient};
@@ -1111,22 +1114,46 @@ fn connect_submitter(
     else {
         panic!("expected auth ok");
     };
+    // Cross-machine path: upload the three blobs from OUR store (hash
+    // verified on arrival) before the descriptor.
+    if let Some(store) = uploads {
+        for id_hex in [&descriptor.manifest, &descriptor.elf, &descriptor.input] {
+            let id = contentstore::ContentId::from_hex(id_hex).unwrap();
+            let bytes = store.get(&id).unwrap();
+            wire::send(
+                &mut stream,
+                &ClientToServer::BlobUpload {
+                    id_hex: id_hex.clone(),
+                    bytes_hex: hex(&bytes),
+                },
+            )
+            .unwrap();
+            let wire::ServerToClient::BlobAck { accepted, reason, .. } =
+                wire::receive::<ServerToClient>(&mut stream).unwrap()
+            else {
+                panic!("expected blob ack");
+            };
+            assert!(accepted, "blob upload rejected: {reason:?}");
+        }
+    }
     // The coordinator hashes the canonical descriptor JSON with blake3
     // and checks the signature over submission_message(job_id, id).
-    let desc_json = serde_json::to_vec(descriptor).unwrap();
-    let desc_id: [u8; 32] = blake3::hash(&desc_json).into();
-    let msg = jobfmt::submission_message(&descriptor.job_id, &desc_id);
-    wire::send(
-        &mut stream,
-        &ClientToServer::JobSubmission {
-            submitter: descriptor.job_id.clone(),
-            descriptor: descriptor.clone(),
-            pubkey_hex: hex(&key.verifying_key().to_bytes()),
-            sig_hex: hex(&key.sign(&msg).to_bytes()),
-            require_zk,
-        },
-    )
-    .unwrap();
+    if submit {
+        let desc_json = serde_json::to_vec(descriptor).unwrap();
+        let desc_id: [u8; 32] = blake3::hash(&desc_json).into();
+        let msg = jobfmt::submission_message(&descriptor.job_id, &desc_id);
+        wire::send(
+            &mut stream,
+            &ClientToServer::JobSubmission {
+                submitter: descriptor.job_id.clone(),
+                descriptor: descriptor.clone(),
+                pubkey_hex: hex(&key.verifying_key().to_bytes()),
+                sig_hex: hex(&key.sign(&msg).to_bytes()),
+                require_zk,
+            },
+        )
+        .unwrap();
+    }
     stream
 }
 
@@ -1206,7 +1233,7 @@ fn zk_proving_queue_end_to_end_with_dedup() {
     // Submission 1: fresh prove (mock: instant; real: ~140 s).
     let mut d1 = desc1.clone();
     d1.job_id = "zkjob-0001".into();
-    let mut stream = connect_submitter(&addr, &key, true, &d1);
+    let mut stream = connect_submitter(&addr, &key, true, &d1, None, true);
     let wire::ServerToClient::SubmissionAck { accepted, proving, .. } =
         wire::receive::<wire::ServerToClient>(&mut stream).unwrap()
     else {
@@ -1243,7 +1270,7 @@ fn zk_proving_queue_end_to_end_with_dedup() {
     // receipt in the cache).
     let mut d2 = desc1.clone();
     d2.job_id = "zkjob-0002".into();
-    let mut stream2 = connect_submitter(&addr, &key, true, &d2);
+    let mut stream2 = connect_submitter(&addr, &key, true, &d2, None, true);
     let wire::ServerToClient::SubmissionAck { accepted, proving, .. } =
         wire::receive::<wire::ServerToClient>(&mut stream2).unwrap()
     else {
@@ -1338,7 +1365,7 @@ fn zk_proving_queue_v2_native_job() {
     let addr = bound.to_string();
 
     let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
-    let mut stream = connect_submitter(&addr, &key, true, &desc);
+    let mut stream = connect_submitter(&addr, &key, true, &desc, None, true);
     let wire::ServerToClient::SubmissionAck { accepted, proving, .. } =
         wire::receive::<wire::ServerToClient>(&mut stream).unwrap()
     else {
@@ -1366,4 +1393,143 @@ fn zk_proving_queue_v2_native_job() {
     assert!(z);
     assert_eq!(&hash, h);
     assert_eq!(o.as_deref(), Some("25a3ab01295a23ff5e515691acd1e06a1d2b56ee38d4dedfd46959725714c5e5"));
+}
+
+/// Cross-machine submission: the submitter's store is NOT the
+/// coordinator's filesystem. The three blobs travel as authenticated
+/// uploads (hash-verified on arrival), then the descriptor — and the
+/// job runs to completion on the workers. Also proves the negative:
+/// a wrong-hash upload is rejected, and the descriptor for missing
+/// blobs is refused with an actionable reason.
+#[test]
+fn submitter_uploads_blobs_cross_machine() {
+    let root = temp_dir("p2pc-net-upload");
+    let coordinator_store = root.join("coordinator-store");
+    let submitter_store_dir = root.join("submitter-store");
+    let jobs_dir = root.join("jobs");
+    std::fs::create_dir_all(&jobs_dir).unwrap();
+    let coordinator_store_s = contentstore::Store::open(&coordinator_store).unwrap();
+    let submitter_store = contentstore::Store::open(&submitter_store_dir).unwrap();
+    let desc = contentstore::publish(&PathBuf::from("../../jobs/demo-hash-smoke"), &submitter_store).unwrap();
+
+    let (bound_tx, bound_rx) = channel();
+    let (job_tx, job_rx) = channel::<JobOutcome>();
+    let cfg = net::ServeConfig {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        jobs_dir: jobs_dir.clone(),
+        store_dir: coordinator_store.clone(),
+        per_job_deadline: std::time::Duration::from_secs(90),
+        ledger: None,
+        require_identity: true,
+        identity_pow_bits: 8,
+        accept_submissions: true,
+        results_dir: None,
+        zk: None,
+        zk_judge: None,
+        zk_prover: None,
+        pool: Some(2),
+        round1_size: None,
+        round1_ids: Some(vec!["wA".into(), "wB".into()]),
+        tls: None,
+        bound_tx: Some(bound_tx),
+        max_jobs: Some(1),
+        job_tx: Some(job_tx),
+    };
+    std::thread::spawn(move || net::serve(cfg).expect("serve"));
+    let bound = bound_rx.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+    let addr = bound.to_string();
+    let key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+
+    // Negative: an upload whose bytes are NOT the claimed content
+    // must be rejected (content-addressed trust), and the descriptor
+    // refused with an actionable reason.
+    {
+        let mut stream = connect_submitter(&addr, &key, false, &desc, None, false);
+        let id_hex = desc.input.clone();
+        wire::send(
+            &mut stream,
+            &wire::ClientToServer::BlobUpload {
+                id_hex,
+                bytes_hex: hex(b"not the input"),
+            },
+        )
+        .unwrap();
+        let wire::ServerToClient::BlobAck { accepted, reason, .. } =
+            wire::receive::<wire::ServerToClient>(&mut stream).unwrap()
+        else {
+            panic!("expected blob ack");
+        };
+        assert!(!accepted, "wrong-hash upload must be rejected");
+        // The descriptor now: the input blob is missing (the corrupted
+        // upload was refused) — refused with an actionable reason.
+        let msg = wire::ClientToServer::JobSubmission {
+            submitter: desc.job_id.clone(),
+            descriptor: desc.clone(),
+            pubkey_hex: hex(&key.verifying_key().to_bytes()),
+            sig_hex: {
+                use blake3::Hasher;
+                let desc_json = serde_json::to_vec(&desc).unwrap();
+                let desc_id: [u8; 32] = blake3::hash(&desc_json).into();
+                let msg = jobfmt::submission_message(&desc.job_id, &desc_id);
+                hex(&key.sign(&msg).to_bytes())
+            },
+            require_zk: false,
+        };
+        wire::send(&mut stream, &msg).unwrap();
+        let wire::ServerToClient::SubmissionAck { accepted, reason, .. } =
+            wire::receive::<wire::ServerToClient>(&mut stream).unwrap()
+        else {
+            panic!("expected submission ack");
+        };
+        assert!(!accepted, "descriptor with missing blobs must be refused");
+        assert!(
+            reason.as_deref().is_some_and(|r| r.contains("blob missing")),
+            "actionable reason expected: {reason:?}"
+        );
+        drop(stream);
+    }
+
+    // Positive: honest uploads from the submitter's own store, then
+    // the descriptor; two workers execute it to a quorum accept.
+    let mut stream = connect_submitter(&addr, &key, false, &desc, Some(&submitter_store), true);
+    let wire::ServerToClient::SubmissionAck { accepted, reason, .. } =
+        wire::receive::<wire::ServerToClient>(&mut stream).unwrap()
+    else {
+        panic!("expected ack");
+    };
+    assert!(accepted, "cross-machine submission accepted: {reason:?}");
+    drop(stream);
+
+    // Workers execute the uploaded job.
+    let identities = root.join("identities");
+    std::fs::create_dir_all(&identities).unwrap();
+    let mut handles = Vec::new();
+    for id in ["wA", "wB"] {
+        let server = addr.clone();
+        let identity = identities.join(format!("{id}.key"));
+        let store_dir = root.join(format!("worker-store-{id}"));
+        handles.push(std::thread::spawn(move || {
+            run_daemon(&DaemonConfig {
+                server,
+                worker_id: id.into(),
+                identity_path: Some(identity),
+                store_dir,
+                listen_port: None,
+                tls: None,
+                corrupt: false,
+                corrupt_byte: None,
+                extra_submits: 0,
+                receipt_file: None,
+            })
+        }));
+    }
+    let job1 = wait_job(&job_rx);
+    let coordinator::Decision::Accept { hash, agreed, .. } = &job1.decision else {
+        panic!("cross-machine job should accept, got {:?}", job1.decision);
+    };
+    assert_eq!(agreed.len(), 2, "both workers agreed");
+    assert_eq!(hash, &job1.results[0].result_hash);
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
 }

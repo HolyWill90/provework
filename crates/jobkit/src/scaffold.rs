@@ -83,6 +83,14 @@ SECTIONS {
 }
 "#;
 
+pub const SCAFFOLD_ABI_CARGO_TOML: &str = r#"[package]
+name = "abi"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+"#;
+
 pub const SCAFFOLD_CARGO_TOML: &str = r#"[package]
 name = "{{NAME}}"
 version = "0.1.0"
