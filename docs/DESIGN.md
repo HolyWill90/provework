@@ -440,8 +440,16 @@ verdict becomes third-party checkable, not just coordinator-asserted.
 
 Proving memory grows with the shard count (nano ≈ 3 shards, smoke ≈
 84), so the CPU-provable envelope on a 32 GB host ends near ~10M VM
-cycles (~22K emulated instructions). GPU proving (a CUDA machine is
-available) or a newer SP1 is the scale-out step. The meta-emulation
+cycles (~28–31K emulated instructions). **GPU proving is now
+measured**: on an RTX PRO 4500 Blackwell (32 GB VRAM, driver 595.71,
+rented on vast.ai for under a dollar), SP1 6.8's CUDA prover runs
+correctly on the Blackwell architecture (sm_120) and proves the
+legacy 168.9M-cycle job in **34.2 s at 26.1 GB peak VRAM** (the job
+that OOM-killed the 32 GB CPU host), and the V2 1.79M-cycle job in
+**2.8 s at 10.6 GB peak VRAM** — a 29× proving speedup over CPU. The
+26.1 GB peak explains the 24 GB VRAM floor as the honest minimum for
+traces of this shape. Receipts verified against the CPU-produced
+outputs; full logs in the benchmark session (2026-09-17). The meta-emulation
 multiplier is the structural cost of the ABI-preserving guest;
 replacing the guest emulator with an ABI trampoline (jobs compiled
 directly for SP1's I/O convention) would remove the ~300x factor for

@@ -7,18 +7,39 @@ name: ci
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - '**.ipynb'
   pull_request:
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - '**.ipynb'
 
 jobs:
+  changes:
+    # Docs/notebook-only changes skip the heavy suite: each job below
+    # is skipped (not absent), so required checks report "skipped" and
+    # satisfy branch protection.
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.f.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: f
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+          fi
+          CHANGED=$(git diff --name-only "$BASE" "$GITHUB_SHA" 2>/dev/null || git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "force-run")
+          echo "changed files:"; echo "$CHANGED" | head -20
+          if echo "$CHANGED" | grep -qE '\.(rs|toml|lock|S|ld|json|bin|yml|yaml)$|^\.github/|^arch-tests/|^jobs/|^elf/|^docker/'; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          fi
+
   test:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -74,6 +95,8 @@ jobs:
           path: "*-release-${{ matrix.os }}.json"
 
   conformance:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     # Independent-implementation differential: the same static RISC-V
     # ELF executed by our emulator and by qemu-riscv64 must produce
     # byte-identical output.
@@ -108,6 +131,8 @@ jobs:
 
 
   audit:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     # Dependency advisories: the RustSec database against Cargo.lock.
     runs-on: ubuntu-latest
     steps:
@@ -121,6 +146,8 @@ jobs:
         # Informational warnings do not fail; known vulnerabilities do.
 
   fuzz:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     # Panic/overflow/ASAN fuzzing of the untrusted-input surface: the
     # ELF parser, the result-format encoders, and the wire decoder.
     runs-on: ubuntu-latest
@@ -149,6 +176,8 @@ jobs:
           path: fuzz/artifacts/
 
   zk-receipt:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     # Re-verify the committed same-ELF SP1 receipt against the local
     # rvcore run: proves the checked-in artifacts still attest the
     # checked-in emulator and job, without needing a prover.
@@ -213,6 +242,8 @@ jobs:
         run: cargo test -p coordinator --test network zk_judge_dispute_receipt_vindicates_honest_worker -- --nocapture
 
   coverage:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     # Line-coverage floor over the verification-critical crates, so
     # security-relevant code cannot silently lose its tests.
     runs-on: ubuntu-latest
@@ -251,7 +282,9 @@ jobs:
         run: cargo llvm-cov --workspace --fail-under-lines 55
 
   cross-verify:
-    needs: test
+    needs: [test, changes]
+    if: needs.changes.outputs.rust == 'true' && always() && needs.test.result == 'success'
+
     runs-on: ubuntu-latest
     steps:
       - name: Download all platform hashes
