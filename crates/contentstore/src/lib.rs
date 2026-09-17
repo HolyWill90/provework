@@ -13,6 +13,12 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ContentId([u8; 32]);
 
+impl From<[u8; 32]> for ContentId {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
 impl From<ContentId> for [u8; 32] {
     fn from(id: ContentId) -> Self {
         id.0

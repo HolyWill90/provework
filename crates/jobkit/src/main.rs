@@ -44,6 +44,12 @@ enum Cmd {
         /// Ed25519 identity for signing the submission (created on first use).
         #[arg(long, default_value = "submitter.key")]
         identity: PathBuf,
+        /// The coordinator's certificate (raw DER, copied from Party
+        /// A's store dir): run the submission over TLS with the
+        /// fingerprint pinned. Required when the coordinator runs
+        /// --tls (party-a.sh does).
+        #[arg(long)]
+        server_cert: Option<PathBuf>,
         /// High-assurance mode: the coordinator proves the job in its
         /// zkVM and returns a receipt-backed result (no worker
         /// consensus). Proving is queued; the outcome arrives when the
@@ -96,7 +102,8 @@ fn main() {
             server,
             identity,
             require_zk,
-        } => submit(&dir, &store, &server, &identity, require_zk),
+            server_cert,
+        } => submit(&dir, &store, &server, &identity, require_zk, server_cert),
         Cmd::Evidence { results, job_id, out } => evidence(&results, &job_id, &out),
         Cmd::Verify {
             bundle,
@@ -124,7 +131,7 @@ fn new_job(name: &str, v2: bool) {
         eprintln!("error: {name} already exists");
         std::process::exit(1);
     }
-    for sub in ["", "src", ".cargo", "abi"] {
+    for sub in ["", "src", ".cargo"] {
         std::fs::create_dir_all(dir.join(sub)).expect("mkdir");
     }
     std::fs::write(
@@ -139,8 +146,9 @@ fn new_job(name: &str, v2: bool) {
         SCAFFOLD_README.replace("{{NAME}}", name),
     )
     .unwrap();
-    std::fs::write(dir.join("abi/abi.rs"), SCAFFOLD_ABI_RS).unwrap();
-    std::fs::write(dir.join("abi/mod.rs"), "pub mod abi;\n").unwrap();
+    std::fs::create_dir_all(dir.join("abi/src")).expect("mkdir abi/src");
+    std::fs::write(dir.join("abi/Cargo.toml"), scaffold::SCAFFOLD_ABI_CARGO_TOML).unwrap();
+    std::fs::write(dir.join("abi/src/lib.rs"), SCAFFOLD_ABI_RS).unwrap();
     std::fs::write(dir.join("src/main.rs"), SCAFFOLD_MAIN_RS).unwrap();
     // A minimal manifest so `jobkit submit` works out of the box.
     let manifest_json = scaffold::SCAFFOLD_MANIFEST
@@ -418,7 +426,14 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn submit(dir: &Path, store: &Path, server: &str, identity: &Path, require_zk: bool) {
+fn submit(
+    dir: &Path,
+    store: &Path,
+    server: &str,
+    identity: &Path,
+    require_zk: bool,
+    server_cert: Option<PathBuf>,
+) {
     let manifest_bytes = std::fs::read(dir.join("job.json")).expect("job.json");
     let manifest: jobfmt::JobManifest = serde_json::from_slice(&manifest_bytes).expect("manifest");
     // Read to validate presence; the blobs themselves are served from
@@ -442,8 +457,17 @@ fn submit(dir: &Path, store: &Path, server: &str, identity: &Path, require_zk: b
 
     let desc_id: [u8; 32] = desc_id.into();
     let msg = jobfmt::submission_message(&descriptor.job_id, &desc_id);
-    let stream = std::net::TcpStream::connect(server).expect("connect coordinator");
-    let mut stream: wire::BoxedStream = Box::new(stream);
+    let tcp = std::net::TcpStream::connect(server).expect("connect coordinator");
+    let mut stream: wire::BoxedStream = match &server_cert {
+        Some(cert_path) => {
+            let cert = std::fs::read(cert_path).expect("read coordinator certificate");
+            let tls = wire::tls::client_stream_pinned(tcp, &cert, server)
+                .expect("tls handshake (is this the coordinator's certificate?)");
+            println!("TLS session established (coordinator fingerprint pinned)");
+            Box::new(tls)
+        }
+        None => Box::new(tcp),
+    };
 
     // Same admission flow as a worker: Hello, mine the PoW, prove the
     // identity, then submit.
@@ -453,6 +477,7 @@ fn submit(dir: &Path, store: &Path, server: &str, identity: &Path, require_zk: b
             pubkey_hex: hex(&key.verifying_key().to_bytes()),
             worker_id: format!("submitter-{}", &hex(&key.verifying_key().to_bytes())[..8]),
             listen_port: None,
+            role: "submitter".into(),
         },
     )
     .unwrap();
@@ -487,6 +512,49 @@ fn submit(dir: &Path, store: &Path, server: &str, identity: &Path, require_zk: b
         }
         other => panic!("unexpected during auth: {other:?}"),
     }
+
+    // Cross-machine path: the coordinator's store is not our
+    // filesystem, so the three blobs travel over the wire first,
+    // hash-verified on arrival. Over-sized blobs are rejected here
+    // with a clear message rather than mid-upload.
+    const MAX_BLOB_BYTES: usize = 16 * 1024 * 1024;
+    for (label, id_hex) in [
+        ("manifest", &descriptor.manifest),
+        ("elf", &descriptor.elf),
+        ("input", &descriptor.input),
+    ] {
+        let id = contentstore::ContentId::from_hex(id_hex).expect("content id");
+        let bytes = store.get(&id).unwrap_or_else(|e| panic!("read {label}: {e}"));
+        if bytes.len() > MAX_BLOB_BYTES {
+            eprintln!(
+                "error: {label} is {} bytes — over the {}-byte upload limit",
+                bytes.len(),
+                MAX_BLOB_BYTES
+            );
+            std::process::exit(1);
+        }
+        wire::send(
+            &mut stream,
+            &wire::ClientToServer::BlobUpload {
+                id_hex: id_hex.clone(),
+                bytes_hex: hex(&bytes),
+            },
+        )
+        .unwrap();
+        match wire::receive::<wire::ServerToClient>(&mut stream).expect("blob ack") {
+            wire::ServerToClient::BlobAck { accepted, reason, .. } => {
+                if !accepted {
+                    eprintln!(
+                        "error: coordinator rejected {label} upload: {}",
+                        reason.as_deref().unwrap_or("?")
+                    );
+                    std::process::exit(1);
+                }
+            }
+            other => panic!("expected BlobAck, got {other:?}"),
+        }
+    }
+    println!("blobs uploaded (3) — hash-verified by the coordinator");
 
     wire::send(
         &mut stream,

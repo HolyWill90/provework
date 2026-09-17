@@ -142,6 +142,10 @@ pub fn receive<T: DeserializeOwned>(stream: &mut impl Read) -> Result<T, WireErr
     serde_json::from_slice(&buf).map_err(|e| WireError::Malformed(e.to_string()))
 }
 
+fn default_role() -> String {
+    "worker".to_string()
+}
+
 /// Messages sent by a worker (client) to the coordinator.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ClientToServer {
@@ -152,6 +156,10 @@ pub enum ClientToServer {
         worker_id: String,
         /// When set, the daemon serves blobs to peers on this port.
         listen_port: Option<u16>,
+        /// "worker" (default) — eligible for job dispatch; "submitter"
+        /// — submits jobs and waits for the outcome, never dispatched.
+        #[serde(default = "default_role")]
+        role: String,
     },
     /// Signature over the nonce bytes (when the worker has an
     /// identity) plus the admission proof-of-work counter.
@@ -178,6 +186,11 @@ pub enum ClientToServer {
         #[serde(default)]
         require_zk: bool,
     },
+    /// A job blob upload from an authenticated submitter whose store
+    /// is not the coordinator's filesystem: the bytes are accepted
+    /// only if BLAKE3(bytes) == id_hex (content-addressed trust), and
+    /// land in the coordinator's store under that id.
+    BlobUpload { id_hex: String, bytes_hex: String },
     /// A zk receipt claim: the worker attaches a verified SP1 receipt
     /// for the whole job (hex of the bincode-serialized receipt). The
     /// signature is over `jobfmt::receipt_claim_message`.
@@ -227,6 +240,9 @@ pub enum ServerToClient {
         zk: bool,
         rejected_reason: Option<String>,
     },
+    /// Reply to a BlobUpload: whether the blob was accepted (hash
+    /// verified) and stored.
+    BlobAck { id_hex: String, accepted: bool, reason: Option<String> },
     /// Immediate reply to a JobSubmission: whether the descriptor
     /// landed in the watched queue (or the zk proving queue).
     SubmissionAck {

@@ -1,7 +1,9 @@
 //! Job-crate scaffolding for `jobkit new`.
 
-pub const SCAFFOLD_ABI_RS: &str = r#"//! The job ABI, inlined so this crate compiles standalone.
+pub const SCAFFOLD_ABI_RS: &str = r#"//! The job ABI constants, as a path-dependency crate of the job.
 //! Contract with the emulator (crates/abi in provework has the docs):
+
+#![no_std]
 
 pub const INPUT_LEN_ADDR: u64 = 0x1000_0000;
 pub const INPUT_DATA_ADDR: u64 = 0x1000_0008;
@@ -19,6 +21,7 @@ pub const SCAFFOLD_MAIN_RS: &str = r#"//! Your job: a deterministic, integer-onl
 #![no_std]
 #![no_main]
 
+use abi;
 use core::arch::asm;
 use core::panic::PanicInfo;
 use core::ptr;
@@ -31,8 +34,8 @@ fn panic(_: &PanicInfo) -> ! {
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     unsafe {
-        let in_len = ptr::read_volatile(crate::abi::INPUT_LEN_ADDR as *const u64) as usize;
-        let in_ptr = crate::abi::INPUT_DATA_ADDR as *const u8;
+        let in_len = ptr::read_volatile(abi::INPUT_LEN_ADDR as *const u64) as usize;
+        let in_ptr = abi::INPUT_DATA_ADDR as *const u8;
 
         // TODO: your computation over the input bytes.
         let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
@@ -42,9 +45,9 @@ pub extern "C" fn _start() -> ! {
 
         // Write the result: u64 length, then bytes.
         let result = acc.to_le_bytes();
-        ptr::write_volatile(crate::abi::OUTPUT_LEN_ADDR as *mut u64, result.len() as u64);
+        ptr::write_volatile(abi::OUTPUT_LEN_ADDR as *mut u64, result.len() as u64);
         for (i, &b) in result.iter().enumerate() {
-            ptr::write_volatile((crate::abi::OUTPUT_DATA_ADDR as *mut u8).add(i), b);
+            ptr::write_volatile((abi::OUTPUT_DATA_ADDR as *mut u8).add(i), b);
         }
 
         asm!("ebreak", options(noreturn))
@@ -83,6 +86,14 @@ SECTIONS {
 }
 "#;
 
+pub const SCAFFOLD_ABI_CARGO_TOML: &str = r#"[package]
+name = "abi"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+"#;
+
 pub const SCAFFOLD_CARGO_TOML: &str = r#"[package]
 name = "{{NAME}}"
 version = "0.1.0"
@@ -90,6 +101,9 @@ edition = "2021"
 
 # Detached from any workspace: this crate targets RISC-V.
 [workspace]
+# The abi sub-crate is its own workspace root (built as a plain path
+# dependency) — exclude it so cargo does not see two roots.
+exclude = ["abi"]
 
 [dependencies]
 abi = { path = "abi" }
@@ -208,3 +222,4 @@ pub const V2_MANIFEST: &str = r#"{
   "elf": "program.elf",
   "input": "input.bin"
 }"#;
+
