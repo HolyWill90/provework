@@ -33,8 +33,11 @@ shows `wB +10, wC −100`.
 ## Quickstart
 
 ```bash
-# 0. toolchain (rustup) + the RISC-V target
+# 0. one-time setup: Rust (rustup), the RISC-V target, and this repo
+curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+source "$HOME/.cargo/env"
 rustup target add riscv64imac-unknown-none-elf
+git clone https://github.com/HolyWill90/provework && cd provework
 
 # 1. scaffold a job crate with your computation
 cargo run --release -p jobkit -- new my-job
