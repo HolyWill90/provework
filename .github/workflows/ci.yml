@@ -284,7 +284,7 @@ jobs:
   cross-verify:
     needs: [test, changes]
     if: needs.changes.outputs.rust == 'true' && always() && needs.test.result == 'success'
-    needs: test
+
     runs-on: ubuntu-latest
     steps:
       - name: Download all platform hashes
