@@ -341,6 +341,7 @@ fn session_once(
             pubkey_hex: pubkey_hex.clone().unwrap_or_default(),
             worker_id: cfg.worker_id.clone(),
             listen_port: peer_server,
+            role: "worker".into(),
         },
     )
     .map_err(|e| e.to_string())?;

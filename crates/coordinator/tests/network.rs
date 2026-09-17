@@ -516,7 +516,8 @@ impl RawClient {
                 pubkey_hex: hex(&key.verifying_key().to_bytes()),
                 worker_id: worker_id.into(),
                 listen_port: None,
-            },
+                role: "worker".into(),
+            }
         )
         .unwrap();
         loop {
@@ -1092,7 +1093,8 @@ fn connect_submitter(
             pubkey_hex: hex(&key.verifying_key().to_bytes()),
             worker_id: "submitter".into(),
             listen_port: None,
-        },
+            role: "submitter".into(),
+        }
     )
     .unwrap();
     let wire::ServerToClient::Nonce { hex: nonce_hex, pow_bits } =
@@ -1408,7 +1410,7 @@ fn submitter_uploads_blobs_cross_machine() {
     let submitter_store_dir = root.join("submitter-store");
     let jobs_dir = root.join("jobs");
     std::fs::create_dir_all(&jobs_dir).unwrap();
-    let coordinator_store_s = contentstore::Store::open(&coordinator_store).unwrap();
+    let _coordinator_store = contentstore::Store::open(&coordinator_store).unwrap();
     let submitter_store = contentstore::Store::open(&submitter_store_dir).unwrap();
     let desc = contentstore::publish(&PathBuf::from("../../jobs/demo-hash-smoke"), &submitter_store).unwrap();
 
@@ -1454,7 +1456,7 @@ fn submitter_uploads_blobs_cross_machine() {
             },
         )
         .unwrap();
-        let wire::ServerToClient::BlobAck { accepted, reason, .. } =
+        let wire::ServerToClient::BlobAck { accepted, .. } =
             wire::receive::<wire::ServerToClient>(&mut stream).unwrap()
         else {
             panic!("expected blob ack");
@@ -1467,7 +1469,6 @@ fn submitter_uploads_blobs_cross_machine() {
             descriptor: desc.clone(),
             pubkey_hex: hex(&key.verifying_key().to_bytes()),
             sig_hex: {
-                use blake3::Hasher;
                 let desc_json = serde_json::to_vec(&desc).unwrap();
                 let desc_id: [u8; 32] = blake3::hash(&desc_json).into();
                 let msg = jobfmt::submission_message(&desc.job_id, &desc_id);

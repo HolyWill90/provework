@@ -52,16 +52,23 @@ cargo run --release -p jobkit -- build my-v2-job
 # 2. compile for the sandbox + validate the ELF
 cargo run --release -p jobkit -- build my-job
 
-# 3a. run as Party B — join a coordinator's fleet as an untrusted executor
-./scripts/party-b.sh <coordinator-addr>
-
 # 3b. run as Party A — start the coordinator (TLS + admission PoW)
 ./scripts/party-a.sh
+#    Party A prints its certificate path (./provework-demo/store/
+#    coordinator-cert.der) — workers and submitters pin its fingerprint.
+
+# 3a. run as Party B — join a coordinator's fleet as an untrusted
+#     executor. Copy the coordinator's certificate first (on one
+#     machine: cp <party-a-work>/store/coordinator-cert.der .), then:
+./scripts/party-b.sh <coordinator-addr> worker-1 coordinator-cert.der
 
 # 4. Party A publishes + submits the job; Party B's fleet executes it.
-#    jobkit submit does both in one step from the job owner's machine:
+#    jobkit submit uploads the job's blobs, signs the submission, and
+#    pins the coordinator's TLS fingerprint — one step from the job
+#    owner's machine:
 cargo run --release -p jobkit -- submit my-job \
-    --server <coordinator-addr> --store ./p2pc-store --identity submitter.key
+    --server <coordinator-addr> --store ./p2pc-store --identity submitter.key \
+    --server-cert coordinator-cert.der
 
 # 5. evidence: assemble the verifier-ready bundle for the finished job
 cargo run --release -p jobkit -- evidence \
@@ -77,7 +84,8 @@ cargo run --release -p jobkit -- verify --bundle evidence-bundle \
 # 6. high-assurance mode: the coordinator proves the job in its zkVM
 #    and the outcome is receipt-backed — no worker consensus at all
 cargo run --release -p jobkit -- submit my-job --require-zk \
-    --server <coordinator-addr> --store ./p2pc-store --identity submitter.key
+    --server <coordinator-addr> --store ./p2pc-store --identity submitter.key \
+    --server-cert coordinator-cert.der
 ```
 
 ## Verification tiers

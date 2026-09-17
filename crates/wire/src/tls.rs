@@ -144,3 +144,28 @@ pub fn client_config_pinned(coordinator_cert_der: &[u8]) -> Result<rustls::Clien
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth())
 }
+
+/// Wrap a connected TCP stream in the pinned-fingerprint TLS client
+/// session and complete the handshake. The single entry point for
+/// every client role (worker daemon, submitter) — the handshake
+/// completes here so callers get a ready-to-use stream.
+pub fn client_stream_pinned(
+    tcp: std::net::TcpStream,
+    coordinator_cert_der: &[u8],
+    server_addr: &str,
+) -> Result<rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>, String> {
+    let cfg = client_config_pinned(coordinator_cert_der)?;
+    let server_name = rustls::pki_types::ServerName::try_from(
+        server_addr.split(':').next().unwrap_or("localhost").to_string(),
+    )
+    .map_err(|e| format!("server name: {e}"))?;
+    let conn = rustls::ClientConnection::new(std::sync::Arc::new(cfg), server_name)
+        .map_err(|e| format!("tls: {e}"))?;
+    let mut tls = rustls::StreamOwned::new(conn, tcp);
+    while tls.conn.is_handshaking() {
+        if let Err(e) = tls.conn.complete_io(&mut tls.sock) {
+            return Err(format!("tls handshake failed: {e}"));
+        }
+    }
+    Ok(tls)
+}

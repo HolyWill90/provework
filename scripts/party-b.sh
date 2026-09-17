@@ -8,8 +8,14 @@
 set -e
 cd "$(dirname "$0")/.."
 
-SERVER="${1:?usage: party-b.sh <coordinator-addr> [worker-id]}"
+SERVER="${1:?usage: party-b.sh <coordinator-addr> [worker-id] [coordinator-cert.der]}"
 ID="${2:-worker-$(hostname | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-12)}"
+CERT="${3:-}"
+CERT_ARGS=()
+if [ -n "$CERT" ]; then
+    CERT_ARGS=(--server-cert "$CERT")
+    echo "   tls:       coordinator certificate pinned ($CERT)"
+fi
 
 echo "== Party B: joining $SERVER as '$ID' (untrusted executor) =="
 echo "   identity:  $ID.key  (created on first use)"
@@ -20,4 +26,4 @@ cargo run --release -p worker -- daemon \
     --server "$SERVER" \
     --id "$ID" \
     --identity "$ID.key" \
-    --store-dir "$ID-store"
+    --store-dir "$ID-store"     "${CERT_ARGS[@]}"

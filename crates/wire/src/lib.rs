@@ -142,6 +142,10 @@ pub fn receive<T: DeserializeOwned>(stream: &mut impl Read) -> Result<T, WireErr
     serde_json::from_slice(&buf).map_err(|e| WireError::Malformed(e.to_string()))
 }
 
+fn default_role() -> String {
+    "worker".to_string()
+}
+
 /// Messages sent by a worker (client) to the coordinator.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ClientToServer {
@@ -152,6 +156,10 @@ pub enum ClientToServer {
         worker_id: String,
         /// When set, the daemon serves blobs to peers on this port.
         listen_port: Option<u16>,
+        /// "worker" (default) — eligible for job dispatch; "submitter"
+        /// — submits jobs and waits for the outcome, never dispatched.
+        #[serde(default = "default_role")]
+        role: String,
     },
     /// Signature over the nonce bytes (when the worker has an
     /// identity) plus the admission proof-of-work counter.

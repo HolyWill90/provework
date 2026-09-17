@@ -101,6 +101,7 @@ enum Event {
         pubkey: String,
         worker_id: String,
         listen_port: Option<u16>,
+        role: String,
     },
     NonceSig { conn: usize, sig: Option<String>, pow_counter: u64 },
     JobSubmission {
@@ -140,6 +141,8 @@ struct Conn {
     peer_addr: Option<String>,
     /// The worker's IP, captured at accept time.
     peer_ip: String,
+    /// "worker" (dispatchable) or "submitter" (never dispatched).
+    role: String,
     /// Blob uploads accepted on this connection (bounded).
     uploads: usize,
 }
@@ -227,6 +230,7 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
                         authed: false,
                         peer_addr: None,
                         peer_ip: peer_ip.clone(),
+                        role: "worker".to_string(),
                         uploads: 0,
                     },
                 );
@@ -271,6 +275,10 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
     let mut jobs_done = 0usize;
     // Descriptors seen failing to parse, for the write-grace window.
     let mut scan_errors: HashMap<PathBuf, Instant> = HashMap::new();
+    // Submitter outcome subscriptions registered BEFORE the scanner
+    // creates the PendingJob — a submission racing the directory
+    // scanner must not lose its outcome notification.
+    let mut submitter_subs: HashMap<String, Vec<usize>> = HashMap::new();
 
     loop {
         if let Some(max) = cfg.max_jobs {
@@ -293,6 +301,10 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
                         .map(|t| t.join(","))
                         .unwrap_or_else(|| "all".into())
                 );
+                let mut subscribers = Vec::new();
+                if let Some(conns_list) = submitter_subs.remove(&descriptor.job_id) {
+                    subscribers = conns_list;
+                }
                 pending = Some(PendingJob {
                     descriptor,
                     targets,
@@ -305,7 +317,7 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
                     started: Instant::now(),
                     zk_accept: None,
                     receipt_claimed: Vec::new(),
-                    subscribers: Vec::new(),
+                    subscribers,
                 });
             }
         }
@@ -316,7 +328,8 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
             if !job.dispatched {
                 let map = conns.lock().unwrap();
                 let named = cfg.round1_ids.as_ref();
-                let authed_count = map.values().filter(|c| c.authed).count();
+                let authed_count =
+                    map.values().filter(|c| c.authed && c.role == "worker").count();
                 let targets_ready = match (&job.targets, named) {
                     (Some(ids), _) => {
                         // Named targets: wait for the targets AND the
@@ -347,7 +360,9 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
                             Some(ids) => ids.contains(&c.worker_id),
                             None => c.authed,
                         };
-                        if eligible && c.authed {
+                        // Submitters wait for their own outcome; they
+                        // are never part of a dispatch pool.
+                        if eligible && c.authed && c.role == "worker" {
                             let hints: Vec<String> = map
                                 .values()
                                 .filter(|p| {
@@ -402,6 +417,7 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
                         map.values()
                             .filter(|c| {
                                 c.authed
+                                    && c.role == "worker"
                                     && !selected_ids.contains(&c.worker_id.as_str())
                                     && targeted
                                         .is_none_or(|ids| !ids.contains(&c.worker_id))
@@ -567,7 +583,7 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
         };
 
         match event {
-            Event::Hello { conn, pubkey, worker_id, listen_port } => {
+            Event::Hello { conn, pubkey, worker_id, listen_port, role } => {
                 let nonce: [u8; 32] = rand_nonce();
                 let nonce_hex = hex(&nonce);
                 let pow_bits = cfg.identity_pow_bits;
@@ -577,6 +593,7 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
                     if !worker_id.is_empty() {
                         c.worker_id = worker_id;
                     }
+                    c.role = if role == "submitter" { "submitter".to_string() } else { "worker".to_string() };
                     c.nonce = Some(nonce.to_vec());
                     if let Some(port) = listen_port {
                         c.peer_addr = Some(format!("{}:{port}", c.peer_ip));
@@ -727,7 +744,7 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
                 }
             }
             Event::BlobUpload { conn, id_hex, bytes_hex } => {
-                handle_blob_upload(&cfg, &store, &conns, conn, &id_hex, &bytes_hex);
+                handle_blob_upload(&store, &conns, conn, &id_hex, &bytes_hex);
             }
             Event::JobSubmission {
                 conn,
@@ -740,6 +757,7 @@ pub fn serve(cfg: ServeConfig) -> Result<ServeOutcome, String> {
                 handle_job_submission(
                     &cfg, &conns, &store, &mut pending, conn, &submitter, descriptor,
                     &pubkey_hex, &sig_hex, require_zk, prove_tx.as_ref(),
+                    &mut submitter_subs,
                 );
             }
             Event::ReceiptClaim {
@@ -1118,7 +1136,6 @@ const MAX_UPLOADS_PER_CONN: usize = 8;
 /// Trust comes from the hash, not the sender: BLAKE3(bytes) must equal
 /// the claimed id, exactly as the store's own integrity checks do.
 fn handle_blob_upload(
-    cfg: &ServeConfig,
     store: &contentstore::Store,
     conns: &Arc<Mutex<HashMap<usize, Conn>>>,
     conn: usize,
@@ -1303,6 +1320,7 @@ fn handle_job_submission(
     sig_hex: &str,
     require_zk: bool,
     prove_tx: Option<&Sender<PendingJob>>,
+    submitter_subs: &mut HashMap<String, Vec<usize>>,
 ) {
     if !cfg.accept_submissions {
         eprintln!("SECURITY: job submission from {submitter} dropped — submissions disabled");
@@ -1490,9 +1508,15 @@ fn handle_job_submission(
             proving: false,
         });
     }
+    // The submitter always waits on THIS job's outcome. The pending
+    // job may not exist yet (the scanner picks the descriptor up
+    // asynchronously), so the registration lives in submitter_subs
+    // and merges into the PendingJob when the scanner creates it.
+    submitter_subs
+        .entry(descriptor.job_id.clone())
+        .or_default()
+        .push(conn);
     if let Some(p) = pending.as_mut() {
-        // A submitter waiting on THIS job's outcome is registered —
-        // rare (resubmission of a running job) but harmless to track.
         if p.descriptor.job_id == descriptor.job_id && !p.subscribers.contains(&conn) {
             p.subscribers.push(conn);
         }
@@ -1689,9 +1713,9 @@ fn session_loop(
             eprintln!("conn {conn}: receive error: {:?}", frame.as_ref().err().unwrap());
         }
         match frame {
-            Ok(Some(ClientToServer::Hello { pubkey_hex, worker_id, listen_port })) => {
+            Ok(Some(ClientToServer::Hello { pubkey_hex, worker_id, listen_port, role })) => {
                 eprintln!("conn {conn}: Hello received");
-                tx.send(Event::Hello { conn, pubkey: pubkey_hex, worker_id, listen_port })
+                tx.send(Event::Hello { conn, pubkey: pubkey_hex, worker_id, listen_port, role })
                     .ok();
             }
             Ok(Some(ClientToServer::NonceSignature { sig_hex, pow_counter })) => {
