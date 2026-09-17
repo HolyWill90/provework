@@ -7,7 +7,15 @@ name: ci
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '**.ipynb'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '**.ipynb'
 
 jobs:
   test:
