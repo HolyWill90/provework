@@ -36,8 +36,10 @@ reducing the same job from 168.9M to 1.79M cycles (94×) and turning
 an unprovable job into an 80.5-second, 15.7 GB proof on an ordinary
 32 GB host, with byte-identical output to the legacy path. Finally, we
 report an empirical hardware gate for GPU proving (SP1 6.8 requires
-≥ 24 GB VRAM, refusing a 6 GB card outright) and the operational
-consequences of each finding. The full system runs as a working
+≥ 24 GB VRAM, refusing a 6 GB card outright) and close the loop: on a
+32 GB Blackwell GPU the unprovable legacy job proves in 34.2 seconds
+(26.1 GB VRAM) and the V2 job proves in 2.8 seconds — receipt-backed
+verification at interactive latency. The full system runs as a working
 network on real heterogeneous hosts, with every security property
 enforced by continuous integration.
 
@@ -362,17 +364,26 @@ the CUDA prover.
 
 The consequence for capacity planning is a clean hardware-class table:
 
-**Table 4 — Prover hardware classes (measured gates).**
+**Table 4 — Prover hardware classes (all measured).**
 
 | Class | Envelope (legacy) | Envelope (V2) | Evidence |
 |---|---|---|---|
-| 32 GB CPU host | ≈28–31K job instructions | ~500K+ job instructions | Table 2, Table 3 |
-| 6 GB GPU | none (hard refusal) | none (hard refusal) | this section |
-| ≥ 24 GB GPU | untested (future work) | untested (future work) | gate measured |
+| 32 GB CPU host | ≈28–31K job instructions (OOM beyond) | ≈1.4M job instructions (memory-bound) | Table 2, Table 3 |
+| 6 GB GPU | hard refusal | hard refusal | this section |
+| **32 GB Blackwell GPU** | **168.9M-cycle job proved in 34.2 s** (peak 26.1 GB VRAM) | **1.79M-cycle job proved in 2.8 s** (peak 10.6 GB VRAM) | this section |
 
-The V2 format moves the interesting workloads into CPU-provable
-territory; the GPU gate becomes relevant only for legacy-format
-proving at scale, and its floor is now measured rather than assumed.
+The GPU measurements close the loop opened by the CPU results. On an
+RTX PRO 4500 Blackwell (32 GB VRAM, driver 595.71, rented on vast.ai,
+total cost under one dollar), the legacy meta-emulated job —
+unprovable on the 32 GB CPU host — proved in **34.2 seconds at
+26.1 GB peak VRAM**, with the receipt verifying against the exact
+output the CPU executions produce. The 26.1 GB peak also *explains*
+SP1's 24 GB floor: it is the honest minimum for traces of this shape,
+not a marketing round-up. The V2 job proved in **2.8 seconds at
+10.6 GB peak VRAM** — a 29× speedup over CPU proving, putting
+receipt-backed verification inside interactive latency for
+native-format jobs. The V2 format moves the bulk of real workloads
+into GPU-comfortable territory even before larger cards are used.
 
 ---
 
