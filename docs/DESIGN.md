@@ -553,6 +553,37 @@ Design consequences, all deliberate:
   the verifier checks exactly that — the "this receipt is for MY
   job" property survives the format change.
 
+## Positioning decision (2026-09): frozen as a research artifact
+
+A structured market search was run against every plausible application
+for the base, each hypothesis eliminated on evidence: government
+benefit calculators (US EITC; AU HELP/JobSeeker/FTB — verified pain,
+but the computation is trusted and cheap to recompute: no trust
+boundary for verification to span), agent tool-call verification
+(sandboxing is solved by Firecracker/Modal/E2B, audit trails by signed
+logs, and enterprise agents run on the enterprise's own trusted
+infra), a Web3 ZK coprocessor (real fit and a paying market, but the
+missing 70% is the on-chain/decentralization stack plus funded
+incumbents — out of solo scope), and self-hosted prover orchestration
+(in the zkVM world verification is mathematically free — a proof
+verifies itself in milliseconds, so the quorum tier is vestigial
+post-SP1-rebase, the dedup cache is a feature not a moat, and the TAM
+analysis collapses to existing K8s/Slurm/Ray users).
+
+The pattern across the search: the base's verification machinery is
+valuable exactly where verification is expensive and the executor is
+untrusted — and both conditions fail everywhere except inside the
+zkVM ecosystem, where SP1 makes verification free. The honest
+conclusion: **no near-term commercial market exists at solo scale.**
+
+Decision: the code is FROZEN at v0.2.0 (no application layer, no MCP
+wrapper, no HTTP API) and the repository is repositioned as what it
+actually is — an open-source experimental research engine and
+benchmark harness for distributed verifiable compute, with the
+measured envelopes (docs/PREPRINT.md) as the front door. The base
+remains available for future work to build on; the one bounded
+question that could reopen the search is recorded under Known gaps.
+
 ## Known gaps (next milestones)
 
 1. Official `riscv-arch-test` suite (the full official riscv-tests

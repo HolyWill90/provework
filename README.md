@@ -2,35 +2,88 @@
 
 [![CI](https://github.com/HolyWill90/provework/actions/workflows/ci.yml/badge.svg)](https://github.com/HolyWill90/provework/actions/workflows/ci.yml)
 
-**Verifiable serverless for deterministic Rust.** Write an integer-only
-Rust function, delegate it to machines you don't trust, and get the
-result back with a cryptographic receipt — plus automatic fraud
-detection: if a worker lies, the judge convicts it and slashes its bond.
+**An open-source experimental research engine and benchmark harness for
+distributed verifiable compute.**
 
-Forked from the [p2p-compute](https://github.com/HolyWill90/p2p-compute)
-research substrate (full history preserved); this repo is the product
-layer built on top of it.
+prowork is a working research instrument: a distributed network that
+executes deterministic programs on untrusted machines and makes the
+results verifiable at three selectable trust tiers — plus the harness
+used to produce the first measured cost curves for zkVM-based
+verification. It is published as a research artifact and benchmark
+(v0.2.0), not as a product. Continuation of the
+[p2p-compute](https://github.com/HolyWill90/p2p-compute) research
+substrate (full history preserved).
 
-## The two-party story
+## The measured numbers
 
-```
-Party A (job owner)                 Party B (untrusted executor)
-  has a computation                   offers machines
-          │                                   │
-          ├── delegate ──────────────────────→│  runs it in the sandbox
-          │                                   │
-          │←──── signed result + receipt ─────│
-          │                                   │
-  verify the receipt                 (if they cheated:)
-  accept the result                  dispute judge convicts
-                                     + bond slashed in the ledger
-```
+Every figure below was measured on real hardware and is reproducible
+from this repo — the full paper, with every claim mapped to a CI test
+or logged run, is [docs/PREPRINT.md](docs/PREPRINT.md).
 
-Real run: [three machines, two owners](docs/overview.html) — one worker
-submitted a fabricated result; the judge convicted it and the ledger
-shows `wB +10, wC −100`.
+**Execution vs proving cost — same job, same input (demo fold over 32 KiB):**
 
-## Quickstart
+| | zkVM cycles | execute | CPU prove (32 GB host) | GPU prove (32 GB Blackwell) |
+|---|---|---|---|---|
+| Legacy — emulator-in-guest | 168,881,446 | 2.5 s | **OOM** (> 32 GB) | **34.2 s** (26.1 GB VRAM) |
+| **V2 — SP1-native** | **1,789,276** | ~2 s | **80.5 s** (15.7 GB) | **2.8 s** (10.6 GB VRAM) |
+
+Key findings:
+
+- **The meta-emulation tax is 322–362×.** Running a legacy-ABI program
+  by embedding its interpreter inside the zkVM costs 322–362× the
+  native cycle count — the measured price of binary-level
+  compatibility, and it converts a compute problem into a
+  memory-capacity problem (proving memory grows with the shard count).
+- **A source-level native ABI (V2) removes it: 94× fewer cycles** —
+  byte-identical output to the legacy path, turning a job that cannot
+  be proved on a 32 GB CPU host into an 80-second CPU proof or a
+  3-second GPU receipt.
+- **GPU proving has a hard 24 GB VRAM floor** (measured refusal on a
+  6 GB card; SP1 6.8). The 26.1 GB peak measured on the legacy job
+  *explains* the floor — it is the honest minimum for traces of this
+  shape.
+- Native interpreter throughput: up to **57.7M instructions/s**
+  (full sweep in `docs/sweep-data/`).
+
+## What it is
+
+- A distributed verification network over real TCP/TLS: a coordinator
+  dispatches deterministic jobs to untrusted workers; every execution
+  reduces to a **journal** (`u64_le instruction count ‖ output`),
+  committed as `SHA-256(journal)`, verified at one of three tiers:
+  1. **Quorum** (N=3→5) with bonded slashing and fraud detection,
+  2. **Optimistic + dispute** — a judge (rvcore replay or zkVM)
+     re-executes and reproduces the identical journal bytes; verdicts
+     carry the judge's own output, never a worker's claim,
+  3. **zk receipts** (SP1) — a proof replaces consensus entirely,
+     produced by a content-keyed proving queue with deduplication and
+     verifiable offline by anyone (`jobkit verify`).
+- Two execution formats: **legacy** bare-metal RISC-V ABI (executed
+  through the pinned emulator as the zkVM guest — zero-migration for
+  existing ELFs) and **V2** SP1-native guests (compiled against
+  `io::read`/`commit`, executed directly by the zkVM).
+- A **benchmark harness** (the `jobkit` CLI) for the envelopes above,
+  plus differential-determinism and conformance drivers (QEMU
+  differential; official riscv-tests 67/67).
+
+Network validation: demonstrated across three physical machines (two
+different owners) and the open internet over TLS — including the
+fraud case: a worker that fabricated a result was convicted by the
+judge and slashed in the ledger (`docs/overview.html`).
+
+## What it is not (honest status)
+
+- **Not a product, and no commercial claim is made.** The repo is
+  frozen as a research artifact at v0.2.0; the market search that
+  preceded the freeze is recorded in `docs/DESIGN.md`.
+- The coordinator is a single (trusted) party; no NAT traversal; peer
+  discovery is coordinator-based.
+- Jobs are deterministic integer-only programs — no floats, no I/O,
+  no clocks — by design: the price of hashable execution.
+- Receipts bind the exact SP1 toolchain version; upgrading re-keys
+  verification. Multi-shard CPU proving is an open infrastructure gap.
+
+## Reproducing the results
 
 ```bash
 # 0. one-time setup: Rust (rustup), the RISC-V target, and this repo
@@ -39,114 +92,72 @@ source "$HOME/.cargo/env"
 rustup target add riscv64imac-unknown-none-elf
 git clone https://github.com/HolyWill90/provework && cd provework
 
-# 1. scaffold a job crate with your computation
-cargo run --release -p jobkit -- new my-job
-#    edit my-job/src/main.rs and my-job/input.bin
+# 1. run the unit + network test suite (quorum, fraud, receipts)
+cargo test --workspace
 
-# 1b. or scaffold a V2 (SP1-native) job: ~100x cheaper to prove, and
-#     verified by zk receipt without re-execution — but executable
-#     only by SP1 fleets. Build auto-routes through a pinned Docker
-#     toolchain when cargo-prove is not installed locally (one-time
-#     image build, then ~20s rebuilds from the mounted host caches).
-cargo run --release -p jobkit -- new my-v2-job --v2
-#    edit my-v2-job/guest/src/main.rs and my-v2-job/input.bin
-cargo run --release -p jobkit -- build my-v2-job
-
-# 2. compile for the sandbox + validate the ELF
+# 2. benchmark: legacy vs V2 execution and proving (the numbers above)
+cargo run --release -p jobkit -- new my-job            # legacy job
 cargo run --release -p jobkit -- build my-job
+cargo run --release -p jobkit -- new my-v2-job --v2    # SP1-native job
+cargo run --release -p jobkit -- build my-v2-job       # auto-routes
+#    through a pinned Docker toolchain when cargo-prove is absent
 
-# 3b. run as Party A — start the coordinator (TLS + admission PoW).
-#     This runs in the FOREGROUND — it blocks this terminal. Open a
-#     second terminal for Party B. First run compiles for a few minutes.
-./scripts/party-a.sh
-#    Party A prints its certificate path (./provework-demo/store/
-#    coordinator-cert.der) — workers and submitters pin its fingerprint.
-
-# 3a. in the SECOND terminal, run as Party B — join the coordinator's
-#     fleet as an untrusted executor. Copy the coordinator's
-#     certificate first (on one machine: cp <party-a-work>/store/
-#     coordinator-cert.der .), then:
+# 3. the two-party network: coordinator (terminal 1, blocks),
+#    workers (terminal 2+), submission (terminal 3). First run
+#    compiles for a few minutes.
+./scripts/party-a.sh            # coordinator (TLS + admission PoW)
+cp ./provework-demo/store/coordinator-cert.der .
 ./scripts/party-b.sh <coordinator-addr> worker-1 coordinator-cert.der
-
-# 4. in a THIRD terminal: submit the job. jobkit uploads the job's
-#    blobs, signs the submission, pins the coordinator's TLS
-#    fingerprint, and WAITS until the job is verified:
 cargo run --release -p jobkit -- submit my-job \
-    --server <coordinator-addr> --store ./p2pc-store --identity submitter.key \
-    --server-cert coordinator-cert.der
+    --server <coordinator-addr> --store ./p2pc-store \
+    --identity submitter.key --server-cert coordinator-cert.der
 
-# 5. evidence: assemble the verifier-ready bundle for the finished job
+# 4. evidence bundle + offline receipt verification
 cargo run --release -p jobkit -- evidence \
     --results <results-dir> --job-id my-job-0001 --out evidence-bundle
-
-#    zk-proved jobs ship a receipt; verify it offline — no coordinator,
-#    no prover (build the verifier once on any Linux machine:
-#    cargo build --release -p sp1-host --bins)
 cargo run --release -p jobkit -- verify --bundle evidence-bundle \
     --zk-verify sp1-host/target/release/zk-verify \
     --guest-elf elf/sp1-guest-emu --desc my-job/descriptor.json
 
-# 6. high-assurance mode: the coordinator proves the job in its zkVM
-#    and the outcome is receipt-backed — no worker consensus at all
+# 5. high-assurance mode: receipt-backed outcome, no worker consensus
 cargo run --release -p jobkit -- submit my-job --require-zk \
-    --server <coordinator-addr> --store ./p2pc-store --identity submitter.key \
-    --server-cert coordinator-cert.der
+    --server <coordinator-addr> --store ./p2pc-store \
+    --identity submitter.key --server-cert coordinator-cert.der
 ```
 
 ## Verification tiers
 
-Every execution emits a **journal** — the 8-byte little-endian
-instruction count followed by the job's output bytes — and workers
-commit to `SHA-256(journal)`. The coordinator's dispute judge
-re-executes the job and reproduces the identical bytes, so a verdict is
-never a worker's claim about the output; it is the judge's own output.
-One journal, three selectable verification tiers:
+Every execution emits the journal described above; one journal, three
+selectable tiers:
 
-| Tier | Mechanism | Trust removed | Cost | Status |
-|---|---|---|---|---|
-| Budget | Quorum, bond slashing, dispute judge | Workers agreeing on a fake result | ~N× | live |
-| Standard | Optimistic acceptance + replay judgment | Same, at 1× unless challenged | ~1× | implemented |
-| Strong | SP1 zkVM receipt **over the emulator itself executing your actual job** | Everything: no trust in any worker | prover tax | receipt verified and accepted by the network (nano envelope) |
+| Tier | Mechanism | Trust removed | Cost |
+|---|---|---|---|
+| Budget | Quorum, bond slashing, dispute judge | Workers agreeing on a fake result | ~N× |
+| Standard | Optimistic acceptance + replay judgment | Same, at 1× unless challenged | ~1× |
+| Strong | SP1 zkVM receipt over the emulator itself executing the actual job | Everything: no trust in any worker | prover tax |
 
-**Execution engine.** Jobs come in two formats. Legacy (`rv-abi`)
-jobs run inside SP1's zkVM through the pinned-emulator guest
-(`elf/sp1-guest-emu`, embedded at build time): the job ELF keeps its
-sandbox ABI, the guest commits a BLAKE3 binding of
-`(manifest, elf, input)` before executing, and Windows dev builds run
-the same emulator natively. **V2 (`format: "sp1-v2"`) jobs are
-SP1-native guests** — compiled against `io::read`/`commit`, executed
-directly by the zkVM with no emulator in the loop: the measured cost
-of the same 32 KiB job drops from 168.9M to 1.79M VM cycles (~94x),
-turning an unprovable job into an 80-second CPU proof. V2 output is
-byte-identical to the legacy path's for the same input; the rvcore
-replay judge refuses V2 jobs (they are the zk judge's jurisdiction).
+**Execution engine.** Legacy (`rv-abi`) jobs run inside SP1's zkVM
+through the pinned-emulator guest (`elf/sp1-guest-emu`, embedded at
+build time): the job ELF keeps its sandbox ABI, the guest commits a
+BLAKE3 binding of `(manifest, elf, input)` before executing, and
+Windows dev builds run the same emulator natively. **V2
+(`format: "sp1-v2"`) jobs are SP1-native guests** — executed directly
+by the zkVM with no emulator in the loop; V2 output is byte-identical
+to the legacy path's for the same input, and the rvcore replay judge
+refuses V2 jobs (they are the zk judge's jurisdiction).
 
-See `docs/DESIGN.md` for the decision log, `docs/QUALIFYING.md` for
-whether your workload fits, `docs/PREPRINT.md` for the measured
-account of the architecture (meta-emulation tax, V2 economics, GPU
-gate), and `docs/overview.html` for a visual briefing.
+See `docs/PREPRINT.md` for the paper, `docs/DESIGN.md` for the
+decision log (including the market-search record), `docs/INTEGRATION.md`
+for the builder-facing interfaces, `docs/LICENSE-STRATEGY.md` for
+licensing, and `docs/overview.html` for a visual briefing.
 
-## What is verified, and what is not
-
-- **Fraud detection over real networks**: demonstrated across three
-  physical machines (two different owners) and the open internet — a
-  worker that fabricated a result was convicted by the judge and
-  slashed in the ledger.
-- **Independent correctness evidence**: the official riscv-tests
-  suites (67/67) and a QEMU differential — sampled evidence, not proof.
-- **Same-ELF zk receipts**: the pinned emulator itself is proven inside
-  the zkVM; CI re-verifies the committed receipt every run. The
-  demonstrated envelope is ~16K instructions (nano); multi-shard
-  proving is an open infrastructure gap.
-
-## The substrate
+## Substrate
 
 The verification engine is a pinned deterministic RISC-V (RV64IMC)
 emulator: the entire architectural state is 32 registers + pc + machine
 CSRs + memory, hashed after every fixed chunk of instructions. The
-determinism contract, the job ABI, and the CI gates are documented in
-the sections below — unchanged from the research substrate this fork
-preserves.
+determinism contract and the job ABI are documented below — unchanged
+from the research substrate.
 
 <details>
 <summary>Substrate details (determinism contract, job ABI, layout)</summary>
@@ -157,7 +168,7 @@ preserves.
 crates/abi           job ABI: memory map, halt convention, pinned ISA string
 crates/rvcore        the emulator: RV64IMC interpreter + chunk-hash chain (BLAKE3)
 crates/jobfmt        job manifest/result formats, signing-message encoding
-crates/jobkit        the product layer: scaffold / build / submit / evidence
+crates/jobkit        the harness CLI: scaffold / build / submit / evidence / verify
 crates/worker        worker daemon + local runner (a "peer")
 crates/coordinator   quorum/dispute/ledger logic + network server (the job client)
 crates/wire          transport: length-prefixed JSON frames, TLS, admission PoW
@@ -168,13 +179,15 @@ arch-tests/          the official riscv-tests ELFs (rv64ui/um/uc, 67 tests)
 jobs/demo-hash       the demo job: no_std Rust, compiled to a RISC-V ELF
 jobs/demo-hash-smoke same program, 32 KiB input — powers the fast network tests
 jobs/demo-hash-nano  1 KiB input — the same-ELF zk receipt's workload
+jobs/demo-v2         the V2 (SP1-native) demo job — the 94x benchmark workload
 jobs/conformance     ISA corner-case suite (explicit inline asm, both impls)
 jobs/agent-task      the agent-work pilot job (see docs/PILOT.md)
 sp1-guest/           zkVM guests: the algorithm (fnv) and the emulator (emu)
 sp1-host/            prover + zk-verify oracle + receipt artifacts
 elf/                 the SP1 guest ELF embedded into production workers
 scripts/             packaging + validation + two-party pilot scripts
-docs/                DESIGN.md (decision log), QUALIFYING.md, PILOT.md, overview.html
+docs/                PREPRINT.md, DESIGN.md (decision log), INTEGRATION.md,
+                     QUALIFYING.md, LICENSE-STRATEGY.md, overview.html
 ```
 
 ### The determinism contract
